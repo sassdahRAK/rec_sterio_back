@@ -1,0 +1,10 @@
+# recsterio backend — heavy, optional ML dependencies.
+# These are imported lazily (see app/services/asr.py and app/services/gemini.py)
+# so the core app, worker and test suite run without them installed.
+-r requirements.txt
+
+# local ASR (feature 2)
+faster-whisper>=1.0
+
+# Gemini second-opinion transcription + merge (feature 4)
+google-genai>=1.0

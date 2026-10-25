@@ -1,0 +1,103 @@
+"""Pytest fixtures.
+
+The tests run against a real PostgreSQL database (JSONB is required by the
+data model) named `recsterio_test`. Set TEST_DATABASE_URL to override.
+"""
+from __future__ import annotations
+
+import os
+import shutil
+import tempfile
+
+import pytest
+
+TEST_DB_NAME = "recsterio_test"
+ADMIN_EMAIL = "admin@test.local"
+ADMIN_PASSWORD = "test-password"
+BOT_TOKEN = "test-bot-service-token"
+
+_ADMIN_DSN = "postgresql://postgres:postgres@localhost:5432/postgres"
+_TEST_DSN = (
+    os.environ.get("TEST_DATABASE_URL")
+    or f"postgresql+psycopg://postgres:postgres@localhost:5432/{TEST_DB_NAME}"
+)
+
+
+def _ensure_test_database() -> None:
+    import psycopg
+
+    try:
+        with psycopg.connect(_ADMIN_DSN, autocommit=True) as conn:
+            row = conn.execute(
+                "select 1 from pg_database where datname = %s", (TEST_DB_NAME,)
+            ).fetchone()
+            if row is None:
+                conn.execute(f'create database "{TEST_DB_NAME}"')
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError(
+            "PostgreSQL is required for the test suite. Start it with "
+            "`brew services start postgresql@15` and make sure the postgres role "
+            f"can log in with the password 'postgres'. Original error: {exc}"
+        ) from exc
+
+
+_ensure_test_database()
+
+_MEDIA_ROOT = tempfile.mkdtemp(prefix="recsterio-test-media-")
+
+# The environment must be configured *before* app.config is imported.
+os.environ["DATABASE_URL"] = _TEST_DSN
+os.environ["SECRET_KEY"] = "test-secret-key"
+os.environ["ADMIN_EMAIL"] = ADMIN_EMAIL
+os.environ["ADMIN_PASSWORD"] = ADMIN_PASSWORD
+os.environ["BOT_API_TOKEN"] = BOT_TOKEN
+os.environ["MEDIA_ROOT"] = _MEDIA_ROOT
+os.environ["WORKER_AUTOSTART"] = "false"
+os.environ["WORKER_POLL_SECONDS"] = "0.2"
+os.environ["GEMINI_API_KEY"] = ""
+os.environ["LOGIN_RATE_LIMIT"] = "10000"
+os.environ["VIDEO_CREATE_RATE_LIMIT"] = "10000"
+
+from fastapi.testclient import TestClient  # noqa: E402
+from sqlalchemy import text  # noqa: E402
+
+from app.auth import seed_admin_user  # noqa: E402
+from app.db import Base, SessionLocal, engine  # noqa: E402
+from app.main import app  # noqa: E402
+
+
+@pytest.fixture(scope="session")
+def client():
+    Base.metadata.drop_all(bind=engine)
+    Base.metadata.create_all(bind=engine)
+    with SessionLocal() as db:
+        seed_admin_user(db)
+    with TestClient(app) as test_client:
+        yield test_client
+    shutil.rmtree(_MEDIA_ROOT, ignore_errors=True)
+
+
+@pytest.fixture(autouse=True)
+def clean_database(client):
+    """Wipe transactional data between tests (admin user is kept)."""
+    with engine.begin() as conn:
+        conn.execute(text("delete from merges"))
+        conn.execute(text("delete from jobs"))
+        conn.execute(text("delete from videos"))
+        conn.execute(text("delete from transcripts"))
+    yield
+
+
+@pytest.fixture(scope="session")
+def auth_headers(client):
+    resp = client.post(
+        "/api/v1/auth/login",
+        json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD},
+    )
+    assert resp.status_code == 200, resp.text
+    return {"Authorization": f"Bearer {resp.json()['token']}"}
+
+
+@pytest.fixture
+def bot_headers():
+    return {"Authorization": f"Bearer {BOT_TOKEN}"}

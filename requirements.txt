@@ -1,0 +1,23 @@
+# recsterio backend — core dependencies.
+# Heavy ML deps (faster-whisper, google-genai) live in requirements-ml.txt and
+# are imported lazily so the API + worker run without them installed.
+fastapi>=0.115
+uvicorn[standard]>=0.30
+sqlalchemy>=2.0
+psycopg[binary]>=3.1
+pydantic>=2.7
+pydantic-settings>=2.3
+bcrypt>=4.1
+PyJWT>=2.8
+python-multipart>=0.0.9
+httpx>=0.27
+
+# video download (feature 1)
+yt-dlp>=2024.8
+
+# tests
+pytest>=8.0
+
+# NOTE: passlib is intentionally NOT used. Its bcrypt backend is broken
+# against bcrypt >= 4.1 (it raises on password verification), so
+# app/auth.py calls the bcrypt library directly.
