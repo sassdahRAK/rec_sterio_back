@@ -42,6 +42,19 @@ class Settings(BaseSettings):
     whisper_device: str = "cpu"
     whisper_compute_type: str = "int8"
 
+    # ---- downloader (yt-dlp) ----
+    # TikTok and YouTube increasingly answer datacenter IPs with a bot check.
+    # Supplying a cookies file (exported from a logged-in browser session the
+    # operator is entitled to use) is the supported way to get past it. Leave
+    # unset to browse anonymously.
+    ytdlp_cookies_file: Optional[str] = None
+    ytdlp_proxy: Optional[str] = None
+    ytdlp_user_agent: Optional[str] = None
+
+    # Direct file upload (POST /videos/upload). Ingestion must not depend on a
+    # platform's willingness to serve a download.
+    max_upload_mb: int = 512
+
     # ---- worker ----
     worker_poll_seconds: float = 3.0
     worker_max_attempts: int = 3

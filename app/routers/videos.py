@@ -1,12 +1,14 @@
 """Video routes: list, create, detail, update, delete, media streaming, retry."""
 from __future__ import annotations
 
+import hashlib
+import logging
 import mimetypes
 from pathlib import Path
 from typing import Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query, Request, Response
+from fastapi import APIRouter, Depends, File, Form, Query, Request, Response, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
@@ -26,8 +28,10 @@ from app.schemas import (
     VideoUpdate,
 )
 from app.security import detect_platform, enforce_rate_limit, validate_source_url
-from app.services import storage
+from app.services import asr, storage
 from app.worker import queue
+
+logger = logging.getLogger("recsterio.videos")
 
 router = APIRouter(prefix="/videos", tags=["videos"])
 
@@ -154,6 +158,178 @@ def create_video(
     db.commit()
     db.refresh(video)
     return VideoOut.model_validate(video)
+
+
+ALLOWED_UPLOAD_SUFFIXES = {
+    ".mp4",
+    ".m4v",
+    ".mov",
+    ".webm",
+    ".mkv",
+    ".avi",
+    ".mp3",
+    ".m4a",
+    ".aac",
+    ".wav",
+    ".flac",
+    ".ogg",
+    ".opus",
+}
+
+
+def _safe_suffix(filename: str | None) -> str:
+    """Allowed lowercase suffix from a client-supplied filename, or ''."""
+    if not filename:
+        return ""
+    suffix = Path(filename).suffix.lower()
+    return suffix if suffix in ALLOWED_UPLOAD_SUFFIXES else ""
+
+
+@router.post("/upload", response_model=VideoOut, status_code=201)
+async def upload_video(
+    request: Request,
+    file: UploadFile = File(...),
+    title: Optional[str] = Form(None),
+    notes: Optional[str] = Form(None),
+    start_transcription: bool = Form(True),
+    db: Session = Depends(get_db),
+    actor: str = Depends(get_actor),
+) -> VideoOut:
+    """Ingest a media file the operator already has on disk.
+
+    Ingestion must not depend on a platform serving a download: TikTok and
+    YouTube refuse most server-side requests, so an operator who has the file
+    can upload it directly and get the same pipeline (checksum, audio
+    extraction, transcription) behind it.
+    """
+    enforce_rate_limit(
+        f"video_create:{_client_ip(request)}",
+        settings.video_create_rate_limit,
+        settings.video_create_rate_window,
+    )
+
+    suffix = _safe_suffix(file.filename)
+    if not suffix:
+        raise AppError(
+            415,
+            "unsupported_media_type",
+            "Unsupported file type. Upload an audio or video file.",
+            [
+                {
+                    "field": "file",
+                    "issue": "unsupported_type",
+                    "filename": file.filename,
+                    "allowed": sorted(ALLOWED_UPLOAD_SUFFIXES),
+                }
+            ],
+        )
+
+    limit_bytes = settings.max_upload_mb * 1024 * 1024
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > limit_bytes:
+        raise AppError(
+            413,
+            "payload_too_large",
+            f"File exceeds the {settings.max_upload_mb} MB upload limit.",
+            [{"limit_bytes": limit_bytes}],
+        )
+
+    video = Video(
+        source_url=f"upload://{Path(file.filename or 'upload').name}",
+        platform="direct",
+        title=title or None,
+        notes=notes or None,
+        status="downloading",
+        progress=0,
+        created_by=actor,
+    )
+    db.add(video)
+    db.flush()
+
+    dest = storage.media_file(video.id, suffix)
+    digest = hashlib.sha256()
+    written = 0
+    try:
+        with dest.open("wb") as out:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > limit_bytes:
+                    raise AppError(
+                        413,
+                        "payload_too_large",
+                        f"File exceeds the {settings.max_upload_mb} MB upload limit.",
+                        [{"limit_bytes": limit_bytes}],
+                    )
+                digest.update(chunk)
+                out.write(chunk)
+    except AppError:
+        _discard_upload(db, video, dest)
+        raise
+    except OSError as exc:
+        _discard_upload(db, video, dest)
+        raise AppError(
+            500, "upload_failed", "Could not write the uploaded file to disk."
+        ) from exc
+
+    if written == 0:
+        _discard_upload(db, video, dest)
+        raise AppError(
+            422, "validation_failed", "The uploaded file is empty.", [{"field": "file"}]
+        )
+
+    checksum = digest.hexdigest()
+    # Idempotency: the same bytes are the same asset, whatever the filename.
+    duplicate = db.execute(
+        select(Video).where(Video.checksum_sha256 == checksum, Video.status != "failed")
+    ).scalars().first()
+    if duplicate is not None:
+        _discard_upload(db, video, dest)
+        raise AppError(
+            409,
+            "conflict",
+            "This file has already been uploaded.",
+            [{"field": "file", "issue": "duplicate_video", "video_id": str(duplicate.id)}],
+            extra={"video": VideoOut.model_validate(duplicate).model_dump(mode="json")},
+        )
+
+    video.checksum_sha256 = checksum
+    video.file_size = written
+    video.local_path = str(dest)
+    # curl and many clients send application/octet-stream for any file, which
+    # tells the dashboard's <video> element nothing. Fall back to the suffix.
+    declared_type = (file.content_type or "").strip()
+    if not declared_type or declared_type == "application/octet-stream":
+        video.mime_type = storage.guess_mime(dest)
+    else:
+        video.mime_type = declared_type
+    video.duration_seconds = asr.probe_duration(dest)
+    video.status = "downloaded"
+    video.progress = 100
+
+    db.flush()
+    queue.enqueue(
+        db,
+        "extract_audio",
+        video_id=video.id,
+        payload={"chain": ["transcribe"] if start_transcription else []},
+        priority=100,
+    )
+    db.commit()
+    db.refresh(video)
+    return VideoOut.model_validate(video)
+
+
+def _discard_upload(db: Session, video: Video, dest: Path) -> None:
+    """Remove a half-created upload so a rejected request leaves nothing behind."""
+    try:
+        if dest.exists():
+            dest.unlink()
+    except OSError:
+        logger.warning("could not remove rejected upload at %s", dest)
+    db.rollback()
 
 
 @router.get("/{video_id}", response_model=VideoDetailOut)

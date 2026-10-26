@@ -204,6 +204,45 @@ def transcribe_audio(
 # ------------------------------------------------------------------ ffmpeg
 
 
+def probe_duration(media_path: Path, timeout_seconds: int | None = None) -> float | None:
+    """Return the media duration in seconds, or None if it cannot be read.
+
+    Used by the upload path, where there is no yt-dlp info dict to take the
+    duration from. Best effort: a missing ffprobe must never fail an upload.
+    """
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return None
+    timeout = timeout_seconds or 60
+    try:
+        proc = subprocess.run(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(media_path),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if proc.returncode != 0:
+        return None
+    raw = (proc.stdout or b"").decode("utf-8", "replace").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
 def extract_audio(
     media_path: Path,
     out_path: Path,

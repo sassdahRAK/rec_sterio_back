@@ -113,6 +113,23 @@ def _build_ydl(opts: dict):
         # Explicitly refuse DRM / protected streams; we never attempt to bypass.
         "allow_unplayable_formats": False,
     }
+
+    # Site bot checks (TikTok, YouTube) are the most common reason a public
+    # link fails from a server IP. A cookies file exported by the operator from
+    # a session they are entitled to use is the supported remedy; it is
+    # configuration, never hardcoded, and never logged.
+    if settings.ytdlp_cookies_file:
+        cookies = Path(settings.ytdlp_cookies_file).expanduser()
+        if not cookies.exists():
+            raise TransientDownloadError(
+                f"YTDLP_COOKIES_FILE points at {cookies}, which does not exist."
+            )
+        base["cookiefile"] = str(cookies)
+    if settings.ytdlp_proxy:
+        base["proxy"] = settings.ytdlp_proxy
+    if settings.ytdlp_user_agent:
+        base["user_agent"] = settings.ytdlp_user_agent
+
     base.update(opts)
     return yt_dlp.YoutubeDL(base)
 

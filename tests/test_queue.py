@@ -106,3 +106,27 @@ def test_cancel_and_requeue():
         queue.requeue(db, job)
         assert job.status == "queued"
         assert job.attempts == 0
+
+
+def test_cancelling_a_merge_fails_its_running_merge_row():
+    """A cancelled merge must not leave its `merges` row stuck at 'running'."""
+    from app.models import Merge, Video
+
+    with SessionLocal() as db:
+        video = Video(source_url="https://example.org/merge-cancel", platform="direct")
+        db.add(video)
+        db.flush()
+        merge = Merge(video_id=video.id, status="running", model="gemini-2.5-pro")
+        db.add(merge)
+        db.flush()
+        job = queue.enqueue(db, "merge", video_id=video.id, payload={})
+        db.commit()
+        merge_id = merge.id
+        job_id = str(job.id)
+
+    with SessionLocal() as db:
+        job = db.get(Job, job_id)
+        queue.cancel(db, job)
+        merge = db.get(Merge, merge_id)
+        assert merge.status == "failed"
+        assert merge.error == "cancelled"

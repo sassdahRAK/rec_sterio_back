@@ -119,6 +119,26 @@ def cancel(db: Session, job: Job) -> Job:
     job.status = "failed"
     job.last_error = "cancelled"
     job.finished_at = utcnow()
+    # A cancelled merge must not leave its `merges` row stuck at 'running'
+    # forever — there would be no way to recover it from the dashboard.
+    if job.kind == "merge" and job.video_id:
+        from app.models import Merge
+
+        rows = (
+            db.execute(
+                select(Merge).where(
+                    Merge.video_id == job.video_id,
+                    Merge.status.in_(("pending", "running")),
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for row in rows:
+            row.status = "failed"
+            row.error = "cancelled"
+        if rows:
+            db.flush()
     db.commit()
     return job
 

@@ -193,7 +193,14 @@ def handle_extract_audio(db: Session, job: Job) -> None:
     if video is None:
         raise PermanentJobError("Video no longer exists.")
     audio = _ensure_audio(db, video)
-    _set_video(db, video, status="transcribing")
+    # Only move to "transcribing" when a transcription job actually follows.
+    # An extract-only request (upload with start_transcription=false) has an
+    # empty chain, and setting "transcribing" would strand the video there
+    # forever with no job left to advance it.
+    if "transcribe" in _chain(job.payload or {}):
+        _set_video(db, video, status="transcribing")
+    else:
+        _set_video(db, video, status="downloaded", progress=100)
     logger.info("audio extracted: %s", audio)
     _continue_chain(db, job)
 
@@ -284,6 +291,20 @@ def _latest_transcript(
     return db.execute(stmt.limit(1)).scalars().first()
 
 
+def _latest_ready_transcript(
+    db: Session, video_id: UUID, source: Optional[str] = None, exclude_source: Optional[str] = None
+) -> Optional[Transcript]:
+    """Newest ready transcript, optionally filtered to / away from one source."""
+    stmt = select(Transcript).where(
+        Transcript.video_id == video_id, Transcript.status == "ready"
+    )
+    if source:
+        stmt = stmt.where(Transcript.source == source)
+    if exclude_source:
+        stmt = stmt.where(Transcript.source != exclude_source)
+    return db.execute(stmt.order_by(Transcript.version.desc()).limit(1)).scalars().first()
+
+
 def handle_merge(db: Session, job: Job) -> None:
     video = db.get(Video, job.video_id) if job.video_id else None
     if video is None:
@@ -306,7 +327,9 @@ def handle_merge(db: Session, job: Job) -> None:
     if payload.get("base_transcript_id"):
         base = db.get(Transcript, UUID(str(payload["base_transcript_id"])))
     if base is None:
-        base = _latest_transcript(db, video.id, source="whisper") or _latest_transcript(db, video.id)
+        base = _latest_ready_transcript(db, video.id, source="whisper")
+    if base is None:
+        base = _latest_ready_transcript(db, video.id, exclude_source="gemini")
     if base is None:
         raise PermanentJobError(
             "No base transcript to merge - generate a Whisper transcript first."
@@ -315,11 +338,18 @@ def handle_merge(db: Session, job: Job) -> None:
     gem = None
     if payload.get("gemini_transcript_id"):
         gem = db.get(Transcript, UUID(str(payload["gemini_transcript_id"])))
-    if gem is None:
-        gem = _latest_transcript(db, video.id, source="gemini")
+    if gem is None or gem.id == base.id:
+        gem = _latest_ready_transcript(db, video.id, source="gemini")
+    if gem is not None and gem.id == base.id:
+        gem = None
     if gem is None:
         raise PermanentJobError(
             "No Gemini transcript to merge - run the Gemini transcription first."
+        )
+    if gem.id == base.id:
+        raise PermanentJobError(
+            "Base and Gemini transcripts resolve to the same version; "
+            "generate an independent Gemini transcript first."
         )
 
     merge_row.base_transcript_id = base.id

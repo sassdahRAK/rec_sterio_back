@@ -10,7 +10,12 @@ from app.services import asr as asr_service
 from app.services import gemini as gemini_service
 from app.services import storage
 from app.worker import queue
-from app.worker.runner import handle_gemini_transcribe, handle_transcribe, run_job
+from app.worker.runner import (
+    handle_extract_audio,
+    handle_gemini_transcribe,
+    handle_transcribe,
+    run_job,
+)
 
 URL = "https://www.youtube.com/watch?v=recsterio-worker-001"
 
@@ -156,3 +161,61 @@ def test_gemini_without_api_key_degrades_gracefully(monkeypatch):
         assert job.status in ("failed", "dead")
         assert "GEMINI_API_KEY" in (job.last_error or "")
         assert db.query(Transcript).filter(Transcript.video_id == video_id).count() == 0
+
+
+def test_extract_only_leaves_the_video_downloaded(monkeypatch):
+    """An upload with start_transcription=false must not strand the video.
+
+    Regression: handle_extract_audio used to set status="transcribing"
+    unconditionally. With an empty chain nothing follows, so the video sat in
+    "transcribing" forever with no job left to advance it.
+    """
+    video_id = _make_video_with_audio()
+    with SessionLocal() as db:
+        job = queue.enqueue(db, "extract_audio", video_id=video_id, payload={"chain": []})
+        db.commit()
+        job_id = str(job.id)
+
+    with SessionLocal() as db:
+        job = db.get(Job, job_id)
+        run_job(db, job)
+        assert job.status == "succeeded", job.last_error
+
+    with SessionLocal() as db:
+        video = db.get(Video, video_id)
+        assert video.status == "downloaded"
+        assert video.progress == 100
+        # Nothing was chained, so no transcribe job may exist.
+        assert (
+            db.query(Job)
+            .filter(Job.video_id == video_id, Job.kind == "transcribe")
+            .count()
+            == 0
+        )
+
+
+def test_extract_with_a_transcribe_chain_moves_to_transcribing(monkeypatch):
+    """The normal path still advances to "transcribing" and queues the next job."""
+    video_id = _make_video_with_audio()
+    with SessionLocal() as db:
+        job = queue.enqueue(
+            db, "extract_audio", video_id=video_id, payload={"chain": ["transcribe"]}
+        )
+        db.commit()
+        job_id = str(job.id)
+
+    with SessionLocal() as db:
+        job = db.get(Job, job_id)
+        run_job(db, job)
+        assert job.status == "succeeded", job.last_error
+
+    with SessionLocal() as db:
+        video = db.get(Video, video_id)
+        assert video.status == "transcribing"
+        nxt = (
+            db.query(Job)
+            .filter(Job.video_id == video_id, Job.kind == "transcribe")
+            .one_or_none()
+        )
+        assert nxt is not None
+        assert nxt.status == "queued"

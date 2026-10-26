@@ -54,17 +54,36 @@ def create_merge(
                 [{"base_transcript_id": str(payload.base_transcript_id)}],
             )
     else:
+        # The base must be the primary transcript, never the Gemini second
+        # opinion - merging Gemini with itself would produce a no-op diff and
+        # drop anything that only the primary transcript heard. Prefer Whisper
+        # (the independent ASR pass); fall back to a manual/merged correction.
         base = db.execute(
             select(Transcript)
-            .where(Transcript.video_id == video.id, Transcript.status == "ready")
+            .where(
+                Transcript.video_id == video.id,
+                Transcript.status == "ready",
+                Transcript.source == "whisper",
+            )
             .order_by(Transcript.version.desc())
             .limit(1)
         ).scalar_one_or_none()
         if base is None:
+            base = db.execute(
+                select(Transcript)
+                .where(
+                    Transcript.video_id == video.id,
+                    Transcript.status == "ready",
+                    Transcript.source != "gemini",
+                )
+                .order_by(Transcript.version.desc())
+                .limit(1)
+            ).scalar_one_or_none()
+        if base is None:
             raise AppError(
                 404,
                 "not_found",
-                "This video has no transcript to merge yet.",
+                "This video has no primary transcript to merge yet.",
                 [{"video_id": str(video.id)}],
             )
 
@@ -77,6 +96,13 @@ def create_merge(
                 "not_found",
                 "Gemini transcript not found for this video.",
                 [{"gemini_transcript_id": str(payload.gemini_transcript_id)}],
+            )
+        if gemini.id == base.id:
+            raise AppError(
+                409,
+                "conflict",
+                "The base and Gemini transcripts must be different versions.",
+                [{"transcript_id": str(base.id)}],
             )
 
     merge = Merge(
