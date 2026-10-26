@@ -79,12 +79,32 @@ def client():
 
 @pytest.fixture(autouse=True)
 def clean_database(client):
-    """Wipe transactional data between tests (admin user is kept)."""
+    """Wipe transactional data between tests (admin user is kept).
+
+    Order matters: children before parents. Folders cascade to members, shares,
+    passcodes and comments, but videos point at folders, so they go first.
+    """
     with engine.begin() as conn:
-        conn.execute(text("delete from merges"))
-        conn.execute(text("delete from jobs"))
-        conn.execute(text("delete from videos"))
-        conn.execute(text("delete from transcripts"))
+        # Accounts a test created go first: they cascade into folders,
+        # memberships, comments and passcode grants. The seeded bootstrap admin
+        # is preserved, and any other account is removed so a test that invites
+        # "member@test.local" cannot collide with a previous run.
+        conn.execute(
+            text("delete from admin_users where email <> :keep"), {"keep": ADMIN_EMAIL}
+        )
+        for table in (
+            "passcode_grants",
+            "folder_passcodes",
+            "share_links",
+            "folder_comments",
+            "folder_members",
+            "merges",
+            "jobs",
+            "videos",
+            "transcripts",
+            "folders",
+        ):
+            conn.execute(text(f"delete from {table}"))
     yield
 
 

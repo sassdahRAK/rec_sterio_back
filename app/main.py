@@ -10,7 +10,19 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
 from app.db import SessionLocal, init_db
 from app.errors import register_exception_handlers
-from app.routers import auth, health, jobs, merges, stats, transcripts, videos
+from app.routers import (
+    auth,
+    folders,
+    health,
+    jobs,
+    merges,
+    passcodes,
+    public,
+    shares,
+    stats,
+    transcripts,
+    videos,
+)
 
 logging.basicConfig(
     level=settings.log_level,
@@ -65,6 +77,10 @@ app.include_router(videos.router, prefix=API_PREFIX)
 app.include_router(transcripts.router, prefix=API_PREFIX)
 app.include_router(merges.router, prefix=API_PREFIX)
 app.include_router(jobs.router, prefix=API_PREFIX)
+app.include_router(folders.router, prefix=API_PREFIX)
+app.include_router(shares.router, prefix=API_PREFIX)
+app.include_router(passcodes.router, prefix=API_PREFIX)
+app.include_router(public.router, prefix=API_PREFIX)
 
 
 @app.get("/")

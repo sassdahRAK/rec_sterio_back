@@ -8,7 +8,8 @@ from fastapi import APIRouter, Depends
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.auth import get_actor
+from app.access import require_video
+from app.auth import Principal, get_optional_principal, get_principal
 from app.db import get_db
 from app.errors import AppError
 from app.models import Transcript, Video
@@ -17,6 +18,7 @@ from app.schemas import (
     GenerateResponse,
     JobOut,
     SegmentList,
+    TranscriptCleanedUpdate,
     TranscriptListOut,
     TranscriptOut,
     TranscriptUpdate,
@@ -64,9 +66,12 @@ def _next_version(db: Session, video_id: UUID) -> int:
 def get_transcript(
     video_id: UUID,
     db: Session = Depends(get_db),
-    actor: str = Depends(get_actor),
+    principal: Principal = Depends(get_optional_principal),
 ) -> TranscriptOut:
-    _get_video(db, video_id)
+    video = _get_video(db, video_id)
+    # Public data cards show their transcript (instruction.txt #3, #8), so this
+    # read follows the video's folder access rather than requiring a sign-in.
+    require_video(db, video, principal)
     transcript = _current_transcript(db, video_id)
     if transcript is None:
         raise AppError(404, "not_found", "No transcript exists for this video.")
@@ -77,9 +82,9 @@ def get_transcript(
 def list_transcripts(
     video_id: UUID,
     db: Session = Depends(get_db),
-    actor: str = Depends(get_actor),
+    principal: Principal = Depends(get_optional_principal),
 ) -> TranscriptListOut:
-    _get_video(db, video_id)
+    require_video(db, _get_video(db, video_id), principal)
     items = db.execute(
         select(Transcript)
         .where(Transcript.video_id == video_id)
@@ -93,10 +98,16 @@ def update_transcript(
     video_id: UUID,
     payload: TranscriptUpdate,
     db: Session = Depends(get_db),
-    actor: str = Depends(get_actor),
+    principal: Principal = Depends(get_principal),
 ) -> TranscriptOut:
-    """Manual transcript edit - always creates a NEW version, never mutates history."""
-    _get_video(db, video_id)
+    """Manual transcript edit - always creates a NEW version, never mutates history.
+
+    A human correction is what turns a Raw card into a Cleaned card
+    (instruction.txt #8), so a manual edit marks the new version cleaned unless
+    the caller says otherwise.
+    """
+    video = _get_video(db, video_id)
+    require_video(db, video, principal, need="editor")
     if payload.content is None or not payload.content.strip():
         raise AppError(
             422,
@@ -116,9 +127,29 @@ def update_transcript(
         content=payload.content,
         segments=segments,
         status="ready",
-        created_by=actor,
+        cleaned=True if payload.cleaned is None else payload.cleaned,
+        created_by=principal.actor,
     )
     db.add(transcript)
+    db.commit()
+    db.refresh(transcript)
+    return TranscriptOut.model_validate(transcript)
+
+
+@router.patch("/{video_id}/transcript", response_model=TranscriptOut)
+def set_transcript_cleaned(
+    video_id: UUID,
+    payload: TranscriptCleanedUpdate,
+    db: Session = Depends(get_db),
+    principal: Principal = Depends(get_principal),
+) -> TranscriptOut:
+    """Flag the current version as Cleaned (or back to Raw) without a new version."""
+    video = _get_video(db, video_id)
+    require_video(db, video, principal, need="editor")
+    transcript = _current_transcript(db, video_id)
+    if transcript is None:
+        raise AppError(404, "not_found", "No transcript exists for this video.")
+    transcript.cleaned = payload.cleaned
     db.commit()
     db.refresh(transcript)
     return TranscriptOut.model_validate(transcript)
@@ -129,10 +160,11 @@ def generate_transcript(
     video_id: UUID,
     payload: GenerateRequest,
     db: Session = Depends(get_db),
-    actor: str = Depends(get_actor),
+    principal: Principal = Depends(get_principal),
 ) -> GenerateResponse:
     """Enqueue transcription work (whisper / gemini / both)."""
     video = _get_video(db, video_id)
+    require_video(db, video, principal, need="editor")
     jobs = []
     if payload.engine in ("whisper", "both"):
         jobs.append(
@@ -163,9 +195,9 @@ def generate_transcript(
 def get_segments(
     video_id: UUID,
     db: Session = Depends(get_db),
-    actor: str = Depends(get_actor),
+    principal: Principal = Depends(get_optional_principal),
 ) -> SegmentList:
-    _get_video(db, video_id)
+    require_video(db, _get_video(db, video_id), principal)
     transcript = _current_transcript(db, video_id)
     if transcript is None or not transcript.segments:
         return SegmentList(segments=[])

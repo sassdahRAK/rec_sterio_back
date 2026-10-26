@@ -13,11 +13,12 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
-from app.auth import get_actor
+from app.access import require_manage, require_read, require_video, visible_folders
+from app.auth import Principal, get_actor, get_optional_principal, get_principal
 from app.config import settings
 from app.db import get_db
 from app.errors import AppError
-from app.models import Job, Merge, Transcript, Video
+from app.models import Folder, Job, Merge, Transcript, Video
 from app.schemas import (
     JobOut,
     TranscriptOut,
@@ -59,12 +60,27 @@ def list_videos(
     status: Optional[str] = None,
     platform: Optional[str] = None,
     q: Optional[str] = None,
+    folder_id: Optional[UUID] = None,
     sort: str = Query("-created_at"),
     db: Session = Depends(get_db),
-    actor: str = Depends(get_actor),
+    principal: Principal = Depends(get_principal),
 ) -> VideoListOut:
     stmt = select(Video)
     count_stmt = select(func.count()).select_from(Video)
+
+    # The console's library is only fully visible to the operator. A member
+    # sees the folders shared with them (plus what they ingested themselves),
+    # so a folder's privacy is not merely cosmetic.
+    if principal.role not in ("admin", "telegram"):
+        roles = visible_folders(db, principal)
+        conditions = [Video.created_by == principal.actor]
+        if roles:
+            conditions.append(Video.folder_id.in_(list(roles.keys())))
+        stmt = stmt.where(or_(*conditions))
+        count_stmt = count_stmt.where(or_(*conditions))
+    if folder_id is not None:
+        stmt = stmt.where(Video.folder_id == folder_id)
+        count_stmt = count_stmt.where(Video.folder_id == folder_id)
     if status:
         stmt = stmt.where(Video.status == status)
         count_stmt = count_stmt.where(Video.status == status)
@@ -106,7 +122,7 @@ def create_video(
     payload: VideoCreate,
     request: Request,
     db: Session = Depends(get_db),
-    actor: str = Depends(get_actor),
+    principal: Principal = Depends(get_principal),
 ) -> VideoOut:
     enforce_rate_limit(
         f"video_create:{_client_ip(request)}",
@@ -114,6 +130,12 @@ def create_video(
         settings.video_create_rate_window,
     )
     source_url = validate_source_url(payload.source_url)
+    if payload.folder_id is not None:
+        folder = db.get(Folder, payload.folder_id)
+        if folder is None:
+            raise AppError(404, "not_found", "Folder not found.", [{"id": str(payload.folder_id)}])
+        # Ingesting *into* a folder is an edit of that dataset.
+        require_manage(db, folder, principal)
 
     # Idempotency: the same URL (that is not failed) must not be duplicated.
     existing = db.execute(
@@ -136,14 +158,24 @@ def create_video(
             extra={"video": VideoOut.model_validate(existing).model_dump(mode="json")},
         )
 
+    position = 0
+    if payload.folder_id is not None:
+        position = db.execute(
+            select(func.coalesce(func.max(Video.position), -1) + 1).where(
+                Video.folder_id == payload.folder_id
+            )
+        ).scalar_one()
+
     video = Video(
         source_url=source_url,
         platform=detect_platform(source_url),
         title=payload.title,
         notes=payload.notes,
+        folder_id=payload.folder_id,
+        position=position,
         status="pending",
         progress=0,
-        created_by=actor,
+        created_by=principal.actor,
     )
     db.add(video)
     db.flush()
@@ -191,9 +223,10 @@ async def upload_video(
     file: UploadFile = File(...),
     title: Optional[str] = Form(None),
     notes: Optional[str] = Form(None),
+    folder_id: Optional[UUID] = Form(None),
     start_transcription: bool = Form(True),
     db: Session = Depends(get_db),
-    actor: str = Depends(get_actor),
+    principal: Principal = Depends(get_principal),
 ) -> VideoOut:
     """Ingest a media file the operator already has on disk.
 
@@ -234,14 +267,21 @@ async def upload_video(
             [{"limit_bytes": limit_bytes}],
         )
 
+    if folder_id is not None:
+        folder = db.get(Folder, folder_id)
+        if folder is None:
+            raise AppError(404, "not_found", "Folder not found.", [{"id": str(folder_id)}])
+        require_manage(db, folder, principal)
+
     video = Video(
         source_url=f"upload://{Path(file.filename or 'upload').name}",
         platform="direct",
         title=title or None,
         notes=notes or None,
+        folder_id=folder_id,
         status="downloading",
         progress=0,
-        created_by=actor,
+        created_by=principal.actor,
     )
     db.add(video)
     db.flush()
@@ -336,20 +376,24 @@ def _discard_upload(db: Session, video: Video, dest: Path) -> None:
 def get_video(
     video_id: UUID,
     db: Session = Depends(get_db),
-    actor: str = Depends(get_actor),
+    principal: Principal = Depends(get_optional_principal),
 ) -> VideoDetailOut:
     video = get_video_or_404(db, video_id)
+    # A video is as readable as the folder it lives in (instruction.txt #3, #9).
+    require_video(db, video, principal)
     transcripts = db.execute(
         select(Transcript)
         .where(Transcript.video_id == video_id)
         .order_by(Transcript.version.desc())
     ).scalars().all()
-    jobs = db.execute(
-        select(Job).where(Job.video_id == video_id).order_by(Job.created_at.desc())
-    ).scalars().all()
     out = VideoDetailOut.model_validate(video)
     out.transcripts = [TranscriptOut.model_validate(t) for t in transcripts]
-    out.jobs = [JobOut.model_validate(j) for j in jobs]
+    # Job history is operational: only signed-in users see the queue internals.
+    if principal.is_signed_in or principal.role == "telegram":
+        jobs = db.execute(
+            select(Job).where(Job.video_id == video_id).order_by(Job.created_at.desc())
+        ).scalars().all()
+        out.jobs = [JobOut.model_validate(j) for j in jobs]
     return out
 
 
@@ -358,9 +402,10 @@ def update_video(
     video_id: UUID,
     payload: VideoUpdate,
     db: Session = Depends(get_db),
-    actor: str = Depends(get_actor),
+    principal: Principal = Depends(get_principal),
 ) -> VideoOut:
     video = get_video_or_404(db, video_id)
+    require_video(db, video, principal, need="editor")
     data = payload.model_dump(exclude_unset=True)
     for field, value in data.items():
         setattr(video, field, value)
@@ -373,9 +418,10 @@ def update_video(
 def delete_video(
     video_id: UUID,
     db: Session = Depends(get_db),
-    actor: str = Depends(get_actor),
+    principal: Principal = Depends(get_principal),
 ) -> Response:
     video = get_video_or_404(db, video_id)
+    require_video(db, video, principal, need="editor")
     db.execute(Transcript.__table__.delete().where(Transcript.video_id == video_id))
     db.execute(Merge.__table__.delete().where(Merge.video_id == video_id))
     db.execute(Job.__table__.delete().where(Job.video_id == video_id))
@@ -389,9 +435,10 @@ def delete_video(
 def retry_video(
     video_id: UUID,
     db: Session = Depends(get_db),
-    actor: str = Depends(get_actor),
+    principal: Principal = Depends(get_principal),
 ) -> JobOut:
     video = get_video_or_404(db, video_id)
+    require_video(db, video, principal, need="editor")
     job = queue.enqueue(
         db,
         "download",
@@ -441,14 +488,30 @@ def _parse_range(header: str, size: int) -> tuple[int, int]:
     return start, end
 
 
+def _authorize_media(db: Session, video: Video, principal) -> None:
+    """Gate media on the folder it lives in, not just on knowing the UUID.
+
+    The public portal serves cards from folders, so a video's media is as
+    public as its folder. An unfiled video is console-only.
+    """
+    if video.folder_id is None:
+        if not principal.is_signed_in:
+            raise AppError(404, "not_found", "Media is not available yet for this video.")
+        return
+    folder = db.get(Folder, video.folder_id)
+    if folder is not None:
+        require_read(db, folder, principal)
+
+
 @router.get("/{video_id}/media")
 def stream_media(
     video_id: UUID,
     request: Request,
     db: Session = Depends(get_db),
-    actor: str = Depends(get_actor),
+    principal=Depends(get_optional_principal),
 ) -> Response:
     video = get_video_or_404(db, video_id)
+    _authorize_media(db, video, principal)
     path = storage.find_media_file(video_id)
     if path is None or not path.exists():
         raise AppError(404, "not_found", "Media is not available yet for this video.")
@@ -491,5 +554,27 @@ def stream_media(
             "Content-Range": f"bytes {start}-{end}/{size}",
             "Accept-Ranges": "bytes",
             "Content-Disposition": f'inline; filename="{path.name}"',
+        },
+    )
+
+
+@router.get("/{video_id}/audio")
+def download_audio(
+    video_id: UUID,
+    db: Session = Depends(get_db),
+    principal=Depends(get_optional_principal),
+) -> Response:
+    """The extracted 16 kHz WAV, for download from a public data card."""
+    video = get_video_or_404(db, video_id)
+    _authorize_media(db, video, principal)
+    path = storage.audio_file(video_id)
+    if not path.exists():
+        raise AppError(404, "not_found", "Audio has not been extracted for this video.")
+    return StreamingResponse(
+        storage.iter_file(path),
+        media_type="audio/wav",
+        headers={
+            "Content-Length": str(path.stat().st_size),
+            "Content-Disposition": f'attachment; filename="{video_id}-audio.wav"',
         },
     )

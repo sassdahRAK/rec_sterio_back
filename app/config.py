@@ -32,6 +32,21 @@ class Settings(BaseSettings):
     # ---- bot / service auth ----
     bot_api_token: str = "replace-me-with-a-shared-service-token"
 
+    # ---- google sign-in (instruction.txt #2) ----
+    # Leave the client id empty to disable the "Continue with Google" button; the
+    # API then answers with a clear 400 instead of redirecting to a broken URL.
+    google_client_id: Optional[str] = None
+    google_client_secret: Optional[str] = None
+    google_redirect_uri: Optional[str] = None
+    # Where the browser lands after a successful Google sign-in. The backend
+    # appends the issued token in the URL fragment so it never reaches a log.
+    admin_frontend_url: str = "http://localhost:5173"
+    # Where share links send the recipient: the public dataset portal, which is
+    # a separate app from the ops console so the console never has to be exposed.
+    portal_frontend_url: str = "http://localhost:5174"
+    # Guest tokens (public browsing, passcode and share redemption).
+    guest_ttl_minutes: int = 1440
+
     # ---- gemini ----
     gemini_api_key: Optional[str] = None
     gemini_model: str = "gemini-2.5-pro"
@@ -65,8 +80,10 @@ class Settings(BaseSettings):
     worker_heartbeat_file: str = str(BACKEND_DIR / "storage" / "worker_heartbeat.json")
 
     # ---- http / security ----
+    # 5173 is the operations console, 5174 the public portal; both call the API
+    # from the browser, so both belong in the default dev allowlist.
     cors_origins: Annotated[List[str], NoDecode] = Field(
-        default_factory=lambda: ["http://localhost:5173"]
+        default_factory=lambda: ["http://localhost:5173", "http://localhost:5174"]
     )
     video_create_rate_limit: int = 20  # per window
     video_create_rate_window: int = 60  # seconds
@@ -78,7 +95,7 @@ class Settings(BaseSettings):
     @classmethod
     def _split_origins(cls, v):
         if v is None or v == "":
-            return ["http://localhost:5173"]
+            return ["http://localhost:5173", "http://localhost:5174"]
         if isinstance(v, str):
             return [o.strip() for o in v.split(",") if o.strip()]
         return list(v)
