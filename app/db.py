@@ -41,6 +41,7 @@ def init_db() -> None:
 
     Base.metadata.create_all(bind=engine)
     _add_missing_columns()
+    _add_missing_constraints()
 
 
 # Columns added after the first release. `create_all` never alters an existing
@@ -72,3 +73,41 @@ def _add_missing_columns() -> None:
     with engine.begin() as conn:
         for statement in _ADDED_COLUMNS:
             conn.exec_driver_sql(statement)
+
+
+# Foreign keys added after the first release. `create_all` only creates a table
+# once, so a constraint declared on a column that predates it is never created
+# -- and the ORM's `ondelete` is then a no-op. The damage is silent: deleting a
+# folder leaves its videos pointing at a folder that no longer exists, so they
+# drop out of every folder listing and out of ZIP exports while still showing up
+# in the global video list.
+#
+# (table, constraint name, column, parent table, parent column, on delete)
+_ADDED_FOREIGN_KEYS = (
+    ("videos", "videos_folder_id_fkey", "folder_id", "folders", "id", "set null"),
+)
+
+
+def _add_missing_constraints() -> None:
+    if engine.dialect.name != "postgresql":
+        return
+    with engine.begin() as conn:
+        for table, name, column, parent, parent_column, on_delete in _ADDED_FOREIGN_KEYS:
+            # Orphaned rows would make ADD CONSTRAINT fail, so repair them first.
+            conn.exec_driver_sql(
+                f"update {table} set {column} = null"
+                f" where {column} is not null"
+                f" and not exists (select 1 from {parent}"
+                f" where {parent}.{parent_column} = {table}.{column})"
+            )
+            exists = conn.exec_driver_sql(
+                "select 1 from pg_constraint c"
+                " where c.conname = %s and c.conrelid = %s::regclass",
+                (name, table),
+            ).fetchone()
+            if exists is None:
+                conn.exec_driver_sql(
+                    f"alter table {table} add constraint {name}"
+                    f" foreign key ({column}) references {parent}({parent_column})"
+                    f" on delete {on_delete}"
+                )
