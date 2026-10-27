@@ -26,6 +26,7 @@ from app.access import (
     visible_folders,
 )
 from app.auth import Principal, get_optional_principal, get_principal
+from app.config import settings
 from app.db import get_db
 from app.errors import AppError
 from app.models import (
@@ -61,15 +62,47 @@ router = APIRouter(tags=["folders"])
 
 
 def _current_user(db: Session, principal: Principal) -> AdminUser:
-    if not principal.is_signed_in:
-        raise AppError(
-            401, "unauthorized", "Sign in to manage dataset folders.",
-            [{"header": "Authorization"}],
+    """The account a new folder is attributed to.
+
+    The bot authenticates with the service token, so its principal is neither an
+    admin nor a member — but ``access.role_on_folder`` already grants it editor on
+    every folder, and it can create share links and passcodes. Requiring a
+    signed-in account here alone made folder *creation* the one dataset action
+    the bot could not perform, so the bot is attributed to the bootstrap
+    operator, whose surface it is.
+    """
+    if principal.is_signed_in:
+        user = user_for(db, principal)
+        if user is None:
+            raise AppError(401, "unauthorized", "Invalid or expired token.")
+        return user
+
+    if principal.role == "telegram":
+        email = (settings.admin_email or "").strip().lower()
+        admin = (
+            db.execute(select(AdminUser).where(AdminUser.email == email)).scalar_one_or_none()
+            if email
+            else None
         )
-    user = user_for(db, principal)
-    if user is None:
-        raise AppError(401, "unauthorized", "Invalid or expired token.")
-    return user
+        if admin is None:
+            admin = db.execute(
+                select(AdminUser)
+                .where(AdminUser.role == "admin")
+                .order_by(AdminUser.created_at)
+            ).scalars().first()
+        if admin is None:
+            raise AppError(
+                500,
+                "server_error",
+                "No operator account exists to own folders created through the bot.",
+                [{"hint": "set ADMIN_EMAIL and ADMIN_PASSWORD"}],
+            )
+        return admin
+
+    raise AppError(
+        401, "unauthorized", "Sign in to manage dataset folders.",
+        [{"header": "Authorization"}],
+    )
 
 
 def _video_count(db: Session, folder_ids: list[UUID]) -> dict[UUID, int]:
@@ -155,8 +188,10 @@ def create_folder(
     principal: Principal = Depends(get_principal),
 ) -> FolderOut:
     user = _current_user(db, principal)
-    if payload.visibility == "public" and principal.role != "admin":
-        # Only the operator publishes to anonymous visitors.
+    # Only the operator publishes to anonymous visitors. The bot counts: its
+    # commands are gated by ADMIN_TELEGRAM_IDS, and it can already issue share
+    # links and passcodes for the folder.
+    if payload.visibility == "public" and principal.role not in ("admin", "telegram"):
         raise AppError(
             403, "forbidden", "Only an admin can create a public folder.",
             [{"field": "visibility"}],

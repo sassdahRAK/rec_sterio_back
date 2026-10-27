@@ -15,6 +15,7 @@ from sqlalchemy import func, select
 from app.db import SessionLocal
 from app.models import Folder, Video
 from tests.helpers import (
+    bot_headers,
     create_folder,
     ensure_member,
     guest_headers,
@@ -55,6 +56,24 @@ def test_only_an_admin_may_publish_a_public_folder(client, auth_headers):
 
     ok = create_folder(client, auth_headers, name="Open", visibility="public")
     assert ok.status_code == 201
+
+
+def test_the_bot_can_create_a_folder(client):
+    """The bot is an editor on every folder, so it must be able to create one.
+
+    It authenticates with the service token, which is neither an admin nor a
+    member; requiring a signed-in account here made folder creation the one
+    dataset action the bot could not perform.
+    """
+    resp = create_folder(client, bot_headers(), name="Bot folder")
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["name"] == "Bot folder"
+    assert body["owner_email"] == "admin@test.local"
+
+    # Publishing is the operator's call, and the bot is the operator's surface.
+    public = create_folder(client, bot_headers(), name="Open", visibility="public")
+    assert public.status_code == 201, public.text
 
 
 def test_folder_name_is_required_and_length_bounded(client, auth_headers):

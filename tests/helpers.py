@@ -62,6 +62,20 @@ def guest_headers() -> dict:
     return {"Authorization": f"Bearer {token}"}
 
 
+def bot_headers() -> dict:
+    """The Telegram bot's service identity.
+
+    The API treats this principal as an editor on every folder, so it is the
+    credential the dataset commands run under.
+    """
+    from app.config import settings
+
+    return {
+        "Authorization": f"Bearer {settings.bot_api_token}",
+        "X-Requested-By": "telegram:bot",
+    }
+
+
 def scoped_headers(folder_id, role: str = "viewer") -> dict:
     """What a passcode or share redemption hands back."""
     token, _ = issue_folder_token(folder_id, role)
