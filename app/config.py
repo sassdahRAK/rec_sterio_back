@@ -36,11 +36,6 @@ class Settings(BaseSettings):
     # Leave the client id empty to disable the "Continue with Google" button; the
     # API then answers with a clear 400 instead of redirecting to a broken URL.
     google_client_id: Optional[str] = None
-    google_client_secret: Optional[str] = None
-    google_redirect_uri: Optional[str] = None
-    # Where the browser lands after a successful Google sign-in. The backend
-    # appends the issued token in the URL fragment so it never reaches a log.
-    admin_frontend_url: str = "http://localhost:5173"
     # Where share links send the recipient: the public dataset portal, which is
     # a separate app from the ops console so the console never has to be exposed.
     portal_frontend_url: str = "http://localhost:5174"
@@ -80,8 +75,9 @@ class Settings(BaseSettings):
     worker_heartbeat_file: str = str(BACKEND_DIR / "storage" / "worker_heartbeat.json")
 
     # ---- http / security ----
-    # 5173 is the operations console, 5174 the public portal; both call the API
-    # from the browser, so both belong in the default dev allowlist.
+    # Both frontends call the API through a same-origin proxy (Vite in dev, Caddy
+    # in deploy), so this allowlist is a dev convenience for anyone who points
+    # VITE_API_BASE_URL at an absolute URL — not a requirement of the normal setup.
     cors_origins: Annotated[List[str], NoDecode] = Field(
         default_factory=lambda: ["http://localhost:5173", "http://localhost:5174"]
     )

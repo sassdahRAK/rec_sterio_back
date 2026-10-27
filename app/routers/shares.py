@@ -50,7 +50,7 @@ def find_active_share(db: Session, token: str) -> ShareLink | None:
 
 
 def share_url(token: str) -> str:
-    base = (settings.portal_frontend_url or settings.admin_frontend_url).rstrip("/")
+    base = settings.portal_frontend_url.rstrip("/")
     return f"{base}/share/{token}"
 
 
