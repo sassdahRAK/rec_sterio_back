@@ -5,7 +5,8 @@ from fastapi import APIRouter, Depends
 from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
-from app.auth import get_actor
+from app.access import require_operator
+from app.auth import Principal, get_principal
 from app.db import get_db
 from app.models import Job, Merge, Transcript, Video
 from app.schemas import StatsOut
@@ -21,8 +22,11 @@ def _counts(db: Session, column, model) -> dict[str, int]:
 @router.get("/stats", response_model=StatsOut)
 def get_stats(
     db: Session = Depends(get_db),
-    actor: str = Depends(get_actor),
+    principal: Principal = Depends(get_principal),
 ) -> StatsOut:
+    # Global aggregates describe the whole deployment, not one folder, so they
+    # are operator data like the job queue.
+    require_operator(principal)
     videos_total = db.execute(select(func.count()).select_from(Video)).scalar_one()
     transcripts_total = db.execute(select(func.count()).select_from(Transcript)).scalar_one()
     merges_total = db.execute(select(func.count()).select_from(Merge)).scalar_one()

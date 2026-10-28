@@ -8,7 +8,8 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app.auth import get_actor
+from app.access import require_operator
+from app.auth import Principal, get_principal
 from app.db import get_db
 from app.errors import AppError
 from app.models import Job
@@ -36,8 +37,9 @@ def list_jobs(
     video_id: Optional[UUID] = None,
     sort: str = Query("-created_at"),
     db: Session = Depends(get_db),
-    actor: str = Depends(get_actor),
+    principal: Principal = Depends(get_principal),
 ) -> JobListOut:
+    require_operator(principal)
     stmt = select(Job)
     count_stmt = select(func.count()).select_from(Job)
     if status:
@@ -77,8 +79,9 @@ def list_jobs(
 def get_job(
     job_id: UUID,
     db: Session = Depends(get_db),
-    actor: str = Depends(get_actor),
+    principal: Principal = Depends(get_principal),
 ) -> JobOut:
+    require_operator(principal)
     return JobOut.model_validate(_get_job(db, job_id))
 
 
@@ -86,8 +89,9 @@ def get_job(
 def retry_job(
     job_id: UUID,
     db: Session =Depends(get_db),
-    actor: str = Depends(get_actor),
+    principal: Principal = Depends(get_principal),
 ) -> JobOut:
+    require_operator(principal)
     job = _get_job(db, job_id)
     if job.status in ("succeeded", "running", "queued"):
         raise AppError(
@@ -105,8 +109,9 @@ def retry_job(
 def cancel_job(
     job_id: UUID,
     db: Session = Depends(get_db),
-    actor: str = Depends(get_actor),
+    principal: Principal = Depends(get_principal),
 ) -> JobOut:
+    require_operator(principal)
     job = _get_job(db, job_id)
     if job.status not in ("running", "queued"):
         raise AppError(

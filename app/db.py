@@ -64,6 +64,15 @@ _ADDED_COLUMNS = (
     "alter table folder_comments add column if not exists author_label varchar(128) "
     "not null default 'unknown'",
     "alter table folder_comments alter column author_id drop not null",
+    # Declared as `index=True` on the model. `create_all` never adds an index to
+    # a table that already exists, so a database created before this existed
+    # would seq-scan every actor-filtered listing (`list_videos`,
+    # `list_dataset_cards`, the dedup paths).
+    "create index if not exists ix_videos_created_by on videos (created_by)",
+    # A 2-hour YouTube video is ~7 GB, which overflows a 32-bit integer and
+    # fails the post-download UPDATE outright (leaving the job orphaned at
+    # 'running'). `create_all` never widens an existing column, so alter it.
+    "alter table videos alter column file_size type bigint",
 )
 
 

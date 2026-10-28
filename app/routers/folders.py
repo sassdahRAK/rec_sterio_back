@@ -22,6 +22,7 @@ from app.access import (
     folder_or_404,
     require_manage,
     require_read,
+    require_video,
     user_for,
     visible_folders,
 )
@@ -103,6 +104,21 @@ def _current_user(db: Session, principal: Principal) -> AdminUser:
         401, "unauthorized", "Sign in to manage dataset folders.",
         [{"header": "Authorization"}],
     )
+
+
+def _is_descendant(db: Session, ancestor: Folder, candidate_id: UUID) -> bool:
+    """True when `candidate_id` is `ancestor` itself or one of its descendants.
+
+    Walks upward from the candidate so a cycle already in the data terminates.
+    """
+    seen: set[UUID] = set()
+    current: Optional[Folder] = db.get(Folder, candidate_id)
+    while current is not None and current.id not in seen:
+        if current.id == ancestor.id:
+            return True
+        seen.add(current.id)
+        current = db.get(Folder, current.parent_id) if current.parent_id else None
+    return False
 
 
 def _video_count(db: Session, folder_ids: list[UUID]) -> dict[UUID, int]:
@@ -266,6 +282,17 @@ def update_folder(
                 [{"field": "parent_id", "issue": "self_reference"}],
             )
         require_manage(db, folder_or_404(db, new_parent), principal)
+        if _is_descendant(db, folder, new_parent):
+            # Rejecting only a direct self-reference still allows A -> B -> A.
+            # `_tree` attaches each node to its parent and only promotes nodes
+            # with no parent present to roots, so a cycle makes both folders
+            # disappear from the listing while staying reachable by id.
+            raise AppError(
+                422,
+                "validation_failed",
+                "A folder cannot be moved into its own sub-folder.",
+                [{"field": "parent_id", "issue": "descendant_reference"}],
+            )
     if data.get("visibility") == "public" and principal.role != "admin":
         raise AppError(
             403, "forbidden", "Only an admin can make a folder public.",
@@ -323,6 +350,13 @@ def place_video(
     video = db.get(Video, video_id)
     if video is None:
         raise AppError(404, "not_found", "Video not found.", [{"id": str(video_id)}])
+
+    # A move writes to both ends: the folder being left and the folder being
+    # entered. Checking only the destination let any signed-in member detach a
+    # video from a folder they cannot see (or pull one out of a private folder
+    # into one they manage).
+    if video.folder_id is not None:
+        require_video(db, video, principal, need="editor")
 
     if payload.folder_id is None:
         video.folder_id = None
@@ -407,7 +441,11 @@ def list_dataset_cards(
         filtered = []
         for video in videos:
             transcript = zip_export.current_transcript(db, video.id)
-            if transcript is not None and bool(transcript.cleaned) is cleaned:
+            # `_card` badges a video with no transcript as "raw", so the filter
+            # must agree: `cleaned=false` keeps the transcript-less units that
+            # `cleaned=true` drops, rather than dropping both.
+            is_cleaned = bool(transcript.cleaned) if transcript is not None else False
+            if is_cleaned is cleaned:
                 filtered.append(video)
         videos = filtered
 

@@ -13,7 +13,14 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
-from app.access import require_manage, require_read, require_video, visible_folders
+from app.access import (
+    folder_or_404,
+    require_manage,
+    require_read,
+    require_video,
+    video_role,
+    visible_folders,
+)
 from app.auth import Principal, get_actor, get_optional_principal, get_principal
 from app.config import settings
 from app.db import get_db
@@ -407,6 +414,12 @@ def update_video(
     video = get_video_or_404(db, video_id)
     require_video(db, video, principal, need="editor")
     data = payload.model_dump(exclude_unset=True)
+    # `folder_id` is a move, not a field edit: entering a folder is a write on
+    # that folder. The guard above covers the folder being left; without this an
+    # editor of folder A could drop a video into a private folder B they cannot
+    # see, which is the same hole as `PUT /videos/{id}/folder`.
+    if data.get("folder_id") is not None:
+        require_manage(db, folder_or_404(db, data["folder_id"]), principal)
     for field, value in data.items():
         setattr(video, field, value)
     db.commit()
@@ -492,10 +505,13 @@ def _authorize_media(db: Session, video: Video, principal) -> None:
     """Gate media on the folder it lives in, not just on knowing the UUID.
 
     The public portal serves cards from folders, so a video's media is as
-    public as its folder. An unfiled video is console-only.
+    public as its folder. An unfiled video has no folder, so it belongs to
+    whoever ingested it — `video_role` applies the creator rule that
+    `GET /videos/{id}` already uses. Letting any signed-in member through here
+    made media and audio wider than the metadata for the same resource.
     """
     if video.folder_id is None:
-        if not principal.is_signed_in:
+        if video_role(db, video, principal) is None:
             raise AppError(404, "not_found", "Media is not available yet for this video.")
         return
     folder = db.get(Folder, video.folder_id)

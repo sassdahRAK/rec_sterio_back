@@ -212,6 +212,23 @@ def require_comment(db: Session, folder: Folder, principal: Principal) -> str:
     return role
 
 
+def require_operator(principal: Principal) -> None:
+    """The operator surface: the job queue, global aggregates, retry and cancel.
+
+    Jobs and stats describe the whole system rather than one folder, so there is
+    no per-folder role to inherit the way `transcripts.py` does. They belong to
+    the operator — the console and the bot's admin-gated commands — and a
+    member who can see one folder must not read the queue that serves them all.
+    """
+    if principal.role not in ("admin", "telegram"):
+        raise AppError(
+            403,
+            "forbidden",
+            "This is an operator-only resource.",
+            [{"role": principal.role}],
+        )
+
+
 def require_video(
     db: Session, video: Video, principal: Principal, need: str = "viewer"
 ) -> str:

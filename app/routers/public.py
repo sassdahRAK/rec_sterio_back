@@ -158,7 +158,11 @@ def list_public_folders(
             scoped.extend(_subtree(db, root))
         known = {f.id for f in folders}
         folders.extend(f for f in scoped if f.id not in known)
-    return PublicFolderListOut(items=_public_tree(db, folders, principal), total=len(folders))
+    tree = _public_tree(db, folders, principal)
+    # `total` must count the roots the client actually receives, not the flat
+    # forest that was fetched to build them. Otherwise a tree with one public
+    # child reports `total: 2` alongside a single-item `items` list.
+    return PublicFolderListOut(items=tree, total=len(tree))
 
 
 @router.get("/folders/{folder_id}", response_model=PublicFolderOut)

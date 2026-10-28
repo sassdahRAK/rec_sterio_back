@@ -163,3 +163,41 @@ def test_video_create_rate_limit(client, auth_headers):
         assert "Retry-After" in second.headers
     finally:
         settings.video_create_rate_limit = original
+
+
+def test_file_size_accepts_a_multi_gigabyte_download(client, auth_headers):
+    """A 2-hour YouTube video is ~7 GB, which overflows a 32-bit integer.
+
+    The download handler writes `file_size` straight from the download result,
+    so an `integer` column failed the UPDATE with `NumericValueOutOfRange` —
+    poisoning the session and leaving the job orphaned at 'running'.
+    """
+    from sqlalchemy import text
+
+    from app.db import SessionLocal, engine
+
+    # The column must be wide enough before any insert is attempted.
+    with engine.connect() as conn:
+        column_type = conn.execute(
+            text(
+                "select data_type from information_schema.columns "
+                "where table_name='videos' and column_name='file_size'"
+            )
+        ).scalar_one()
+    assert column_type == "bigint", column_type
+
+    seven_gb = 7_614_531_447
+    assert seven_gb > 2_147_483_647  # would overflow the old integer column
+
+    with SessionLocal() as db:
+        video = Video(source_url=URL + "?big=1", platform="youtube", file_size=seven_gb)
+        db.add(video)
+        db.commit()
+        db.refresh(video)
+        assert video.file_size == seven_gb
+        stored = db.execute(
+            text("select file_size from videos where id=:i"), {"i": video.id}
+        ).scalar_one()
+        assert stored == seven_gb
+        db.delete(video)
+        db.commit()

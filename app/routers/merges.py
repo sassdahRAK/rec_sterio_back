@@ -7,7 +7,8 @@ from fastapi import APIRouter, Depends
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.auth import get_actor
+from app.access import require_video
+from app.auth import Principal, get_principal
 from app.config import settings
 from app.db import get_db
 from app.errors import AppError
@@ -38,10 +39,13 @@ def create_merge(
     video_id: UUID,
     payload: MergeCreate,
     db: Session = Depends(get_db),
-    actor: str = Depends(get_actor),
+    principal: Principal = Depends(get_principal),
 ) -> MergeOut:
     """Enqueue a Gemini-assisted reconciliation job."""
     video = _get_video(db, video_id)
+    # A merge enqueues a job and writes a transcript version, so it needs the
+    # editor role on the video's folder — not merely a valid token.
+    require_video(db, video, principal, need="editor")
 
     base: Transcript | None = None
     if payload.base_transcript_id:
@@ -135,9 +139,9 @@ def create_merge(
 def list_merges(
     video_id: UUID,
     db: Session = Depends(get_db),
-    actor: str = Depends(get_actor),
+    principal: Principal = Depends(get_principal),
 ) -> MergeListOut:
-    _get_video(db, video_id)
+    require_video(db, _get_video(db, video_id), principal)
     items = db.execute(
         select(Merge).where(Merge.video_id == video_id).order_by(Merge.created_at.desc())
     ).scalars().all()
@@ -148,19 +152,24 @@ def list_merges(
 def get_merge(
     merge_id: UUID,
     db: Session = Depends(get_db),
-    actor: str = Depends(get_actor),
+    principal: Principal = Depends(get_principal),
 ) -> MergeOut:
-    return MergeOut.model_validate(_get_merge(db, merge_id))
+    merge = _get_merge(db, merge_id)
+    require_video(db, _get_video(db, merge.video_id), principal)
+    return MergeOut.model_validate(merge)
 
 
 @router.post("/merges/{merge_id}/apply", response_model=TranscriptOut)
 def apply_merge(
     merge_id: UUID,
     db: Session = Depends(get_db),
-    actor: str = Depends(get_actor),
+    principal: Principal = Depends(get_principal),
 ) -> TranscriptOut:
     """Promote the merged transcript to be the current transcript."""
     merge = _get_merge(db, merge_id)
+    # Applying writes a new transcript version, so it needs the editor role on
+    # the merge's video rather than just a valid token.
+    require_video(db, _get_video(db, merge.video_id), principal, need="editor")
     if merge.status != "ready" or not merge.diff:
         raise AppError(
             409,
@@ -183,7 +192,7 @@ def apply_merge(
             content=content,
             segments=segments,
             status="ready",
-            created_by=actor,
+            created_by=principal.actor,
         )
         db.add(merged)
         db.flush()

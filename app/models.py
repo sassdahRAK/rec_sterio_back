@@ -5,6 +5,7 @@ import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     DateTime,
     Float,
@@ -46,12 +47,17 @@ class Video(Base):
     progress: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     local_path: Mapped[str | None] = mapped_column(Text, nullable=True)
-    file_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # BigInteger, not Integer: a 2-hour YouTube video is ~7 GB, which overflows
+    # Postgres' 32-bit integer (max 2,147,483,647) and fails the UPDATE.
+    file_size: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     duration_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
     mime_type: Mapped[str | None] = mapped_column(String(128), nullable=True)
     checksum_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     thumbnail_url: Mapped[str | None] = mapped_column(Text, nullable=True)
-    created_by: Mapped[str] = mapped_column(String(128), nullable=False, default="system")
+
+    # A hot filter: `list_videos`, `list_dataset_cards` and the dedup paths all
+    # select by ingesting actor.
+    created_by: Mapped[str] = mapped_column(String(128), nullable=False, default="system", index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow

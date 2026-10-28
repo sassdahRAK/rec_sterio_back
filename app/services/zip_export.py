@@ -123,6 +123,10 @@ def build_folder_zip(db: Session, folder: Folder, dest: Path) -> int:
                 text = transcript_text(transcript)
                 if text:
                     # Written from memory; a transcript is small and text-only.
+                    # The entry cap applies here too — a tree of transcript-only
+                    # units must not exceed MAX_ENTRIES via this branch.
+                    if written >= MAX_ENTRIES:
+                        raise ValueError("archive would exceed the entry limit")
                     info = zipfile.ZipInfo(f"{unit}/transcript/{video_slug(video)}.txt")
                     payload = text.encode("utf-8")
                     if total_bytes + len(payload) > MAX_TOTAL_BYTES:
