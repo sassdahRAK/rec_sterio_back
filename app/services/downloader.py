@@ -7,7 +7,6 @@ implemented or attempted.
 from __future__ import annotations
 
 import logging
-import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -65,6 +64,11 @@ class DownloadResult:
     file_size: Optional[int] = None
     mime_type: Optional[str] = None
     extractor: Optional[str] = None
+    # TvNa collection schema (instruction.txt #6): fields the platform knows
+    # better than a human retyping them.
+    author_handle: Optional[str] = None
+    caption: Optional[str] = None
+    date_posted: Optional[str] = None
 
 
 @dataclass
@@ -121,17 +125,52 @@ def _build_ydl(opts: dict):
     if settings.ytdlp_cookies_file:
         cookies = Path(settings.ytdlp_cookies_file).expanduser()
         if not cookies.exists():
-            raise TransientDownloadError(
-                f"YTDLP_COOKIES_FILE points at {cookies}, which does not exist."
+            # The path belongs in the operator's log, never in the chat error.
+            logger.error("YTDLP_COOKIES_FILE points at %s, which does not exist.", cookies)
+            raise DownloadError(
+                "YTDLP_COOKIES_FILE is set but the cookies file is missing on the "
+                "server. The operator must create it (see deploy docs)."
             )
         base["cookiefile"] = str(cookies)
+    if settings.ytdlp_cookies_from_browser:
+        browser, _, profile = settings.ytdlp_cookies_from_browser.partition(":")
+        browser = browser.strip()
+        profile = profile.strip() or None
+        if not browser:
+            raise DownloadError(
+                "YTDLP_COOKIES_FROM_BROWSER is set but names no browser. "
+                "Use e.g. 'chrome' or 'chrome:Profile 1'."
+            )
+        base["cookiesfrombrowser"] = (browser, profile, None, None)
     if settings.ytdlp_proxy:
         base["proxy"] = settings.ytdlp_proxy
     if settings.ytdlp_user_agent:
         base["user_agent"] = settings.ytdlp_user_agent
+    if settings.ytdlp_impersonate and settings.ytdlp_impersonate.strip():
+        # yt-dlp wants an ImpersonateTarget object here, not a plain string:
+        # a string trips an isinstance assert inside yt-dlp as soon as the
+        # impersonation handler (curl-cffi) is installed.
+        try:
+            base["impersonate"] = yt_dlp.networking.impersonate.ImpersonateTarget.from_str(
+                settings.ytdlp_impersonate.strip()
+            )
+        except ValueError as exc:
+            raise DownloadError(
+                f"YTDLP_IMPERSONATE={settings.ytdlp_impersonate!r} is not a valid "
+                "impersonation target. Use a browser name like 'chrome'."
+            ) from exc
 
     base.update(opts)
-    return yt_dlp.YoutubeDL(base)
+    try:
+        return yt_dlp.YoutubeDL(base)
+    except yt_dlp.utils.YoutubeDLError as exc:
+        # Construction happens outside download()'s try/except, so without this
+        # wrap a missing curl-cffi would surface as an unclassified retry loop.
+        raise DownloadError(
+            f"Impersonation was requested (YTDLP_IMPERSONATE={settings.ytdlp_impersonate}) "
+            "but its dependency is missing on the server. Install curl-cffi "
+            f"(pip install -r requirements.txt). {_first_line(str(exc))}"
+        ) from exc
 
 
 def download(
@@ -176,6 +215,7 @@ def download(
     except Exception as exc:  # yt-dlp raises DownloadError / ExtractorError
         message = str(exc)
         lowered = message.lower()
+        platform = detect_platform(source_url)
         if any(marker in lowered for marker in PROTECTED_MARKERS):
             raise DownloadError(
                 "This content is protected, private or otherwise not publicly "
@@ -185,6 +225,21 @@ def download(
             raise TransientDownloadError(
                 "No usable media format was offered by the server. The content may "
                 "be protected or region-locked."
+            ) from exc
+        # A 429 is the site throttling this server, not refusing it: retrying
+        # later is the correct response, so check it before the permanent
+        # bot-block markers.
+        if any(marker in lowered for marker in RATE_LIMIT_MARKERS):
+            raise TransientDownloadError(
+                f"the site is rate-limiting this server; the job will retry with "
+                f"backoff: {_first_line(message)}"
+            ) from exc
+        # A bot check is permanent for this configuration: retrying the same
+        # request from the same IP produces the same wall. Say what fixes it.
+        if any(marker in lowered for marker in BLOCK_MARKERS):
+            raise DownloadError(
+                f"{platform.capitalize() if platform != 'unknown' else 'The site'} "
+                f"blocked this request: {_first_line(message)}. {_block_hint(platform)}"
             ) from exc
         raise TransientDownloadError(f"Download failed: {_first_line(message)}") from exc
 
@@ -206,6 +261,101 @@ def download(
         file_size=storage.file_size(path),
         mime_type=storage.guess_mime(path),
         extractor=info.get("extractor_key"),
+        author_handle=normalize_handle(info),
+        caption=first_words(info.get("description") or info.get("title")),
+        date_posted=normalize_upload_date(info.get("upload_date")),
+    )
+
+
+# ------------------------------------------------------------------ TvNa metadata
+# The TvNa schema (instruction.txt #6) asks for an author handle, the first 20
+# words of the caption verbatim, and a post date. yt-dlp already has all three
+# in its info dict; formatting them here means the collector never retypes them.
+
+CAPTION_WORDS = 20
+
+
+def normalize_handle(info: dict) -> Optional[str]:
+    """`@handle` when the platform exposes one, else the display name."""
+    handle = (info.get("uploader_id") or "").strip()
+    if handle:
+        # TikTok/YouTube report the id without the @; Instagram with it.
+        return handle if handle.startswith("@") else f"@{handle}"
+    uploader = (info.get("uploader") or "").strip()
+    return uploader or None
+
+
+def first_words(text: Optional[str], limit: int = CAPTION_WORDS) -> Optional[str]:
+    """The first `limit` words, verbatim — no ellipsis, no re-punctuation."""
+    if not text:
+        return None
+    words = str(text).split()
+    if not words:
+        return None
+    return " ".join(words[:limit])
+
+
+def normalize_upload_date(value: Optional[str]) -> Optional[str]:
+    """yt-dlp reports YYYYMMDD; the schema wants YYYY-MM-DD (or 'n.d.')."""
+    if not value:
+        return "n.d."
+    raw = str(value).strip()
+    if len(raw) == 8 and raw.isdigit():
+        return f"{raw[:4]}-{raw[4:6]}-{raw[6:]}"
+    return raw or "n.d."
+
+
+# The site is throttling this server; backing off is the remedy, not cookies.
+RATE_LIMIT_MARKERS = (
+    "too many requests",
+    "rate limit",
+    "http error 429",
+)
+
+# Errors that mean "the site refused this server", which no retry will fix.
+BLOCK_MARKERS = (
+    "unexpected response from webpage request",
+    "captcha",
+    "blocked",
+    "bot check",
+    "please verify",
+    "confirm you're not a robot",
+)
+
+# What the operator should actually do, per platform. Retrying is not advice;
+# supplying a session is.
+COOKIE_HINTS = {
+    "tiktok": (
+        "TikTok refuses most requests that do not look like a real browser. "
+        "Export a cookies file from a session you are entitled to use and set "
+        "YTDLP_COOKIES_FILE. Also set YTDLP_IMPERSONATE=chrome so the request "
+        "carries a real browser TLS fingerprint; cookies alone no longer get a "
+        "server past the bot check."
+    ),
+    "facebook": (
+        "Facebook shows almost nothing to an anonymous server. Export cookies "
+        "from a logged-in session (c_user + xs) and set YTDLP_COOKIES_FILE. "
+        "For local development, YTDLP_COOKIES_FROM_BROWSER (e.g. 'chrome') "
+        "reads the same session straight from the browser instead."
+    ),
+    "instagram": (
+        "Instagram requires a logged-in session for most media. Set "
+        "YTDLP_COOKIES_FILE to a cookies file from a session you may use."
+    ),
+    "youtube": (
+        "YouTube is asking this server to prove it is not a bot. Set "
+        "YTDLP_COOKIES_FILE, or try YTDLP_PROXY from an address you control."
+    ),
+}
+
+
+def _block_hint(platform: str) -> str:
+    hint = COOKIE_HINTS.get(platform)
+    if hint:
+        return hint
+    return (
+        "The site refused this server. Setting YTDLP_COOKIES_FILE and "
+        "YTDLP_IMPERSONATE is the supported remedy; retrying alone will not help."
     )
 
 

@@ -55,6 +55,29 @@ class Video(Base):
     checksum_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     thumbnail_url: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # ---- Telegram mirror (instruction.txt #4) ----
+    # "Store the video in Telegram and link it to the database". The Bot API
+    # caps `getFile` at 20 MB, so a file_id makes a *small* clip re-fetchable
+    # and nothing more. Recorded so the catalogue points at the copy even when
+    # the bytes cannot come back; the local file stays authoritative.
+    telegram_file_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    telegram_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+
+    # ---- TvNa collection schema (instruction.txt #6) ----
+    # `tvna_serial` is the number behind the public ID "PP-001", stored as an
+    # integer so it sorts and the display form is derived in exactly one place.
+    # NULL means "not yet recorded as a TvNa item".
+    tvna_serial: Mapped[int | None] = mapped_column(Integer, nullable=True, unique=True, index=True)
+    source_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    author_handle: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # "YYYY-MM-DD", or the literal "n.d." when the platform does not say.
+    date_posted: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    caption: Mapped[str | None] = mapped_column(Text, nullable=True)
+    location_tag: Mapped[str | None] = mapped_column(Text, nullable=True)
+    collection_method: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    collected_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    collection_date: Mapped[str | None] = mapped_column(String(16), nullable=True)
+
     # A hot filter: `list_videos`, `list_dataset_cards` and the dedup paths all
     # select by ingesting actor.
     created_by: Mapped[str] = mapped_column(String(128), nullable=False, default="system", index=True)

@@ -56,10 +56,14 @@ class Settings(BaseSettings):
     # TikTok and YouTube increasingly answer datacenter IPs with a bot check.
     # Supplying a cookies file (exported from a logged-in browser session the
     # operator is entitled to use) is the supported way to get past it. Leave
-    # unset to browse anonymously.
+    # unset to browse anonymously. Browser cookies and TLS impersonation are
+    # the local-dev equivalents: reuse the operator's own browser session and
+    # send a real browser TLS fingerprint.
     ytdlp_cookies_file: Optional[str] = None
     ytdlp_proxy: Optional[str] = None
     ytdlp_user_agent: Optional[str] = None
+    ytdlp_cookies_from_browser: Optional[str] = None  # "chrome" or "chrome:Profile 1" — local dev only
+    ytdlp_impersonate: Optional[str] = None           # e.g. "chrome"; needs curl-cffi
 
     # Direct file upload (POST /videos/upload). Ingestion must not depend on a
     # platform's willingness to serve a download.

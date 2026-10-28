@@ -5,7 +5,14 @@ from datetime import datetime, timezone
 from typing import Annotated, Any, Dict, List, Literal, Optional
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, PlainSerializer, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PlainSerializer,
+    computed_field,
+    field_validator,
+)
 
 
 def _utc_iso(value: datetime) -> str:
@@ -107,6 +114,43 @@ class VideoMove(BaseModel):
     position: Optional[int] = None
 
 
+# ---------------------------------------------------------------- TvNa record
+# instruction.txt #6: the collection schema the TvNa platform requires. One
+# record per collected item, attached to the video it describes.
+
+SOURCE_TYPES = ("Video", "Discover Page", "Profile")
+COLLECTION_METHODS = ("Manual browse", "Research API")
+
+
+class TvnaRecordIn(BaseModel):
+    """The fields a collector supplies. `location_tag` is the only required one.
+
+    Everything else either has a sane default or is filled in from the download
+    metadata (platform, author, date, caption) before the collector is asked.
+    """
+
+    location_tag: str = Field(min_length=1, max_length=500)
+    source_type: Literal["Video", "Discover Page", "Profile"] = "Video"
+    author_handle: Optional[str] = Field(None, max_length=255)
+    date_posted: Optional[str] = Field(None, max_length=16)
+    caption: Optional[str] = None
+    collection_method: Literal["Manual browse", "Research API"] = "Manual browse"
+    collected_by: Optional[str] = Field(None, max_length=128)
+    collection_date: Optional[str] = Field(None, max_length=16)
+    notes: Optional[str] = None
+
+
+class TelegramLinkIn(BaseModel):
+    """The Telegram copy of a video (instruction.txt #4).
+
+    `file_id` is what `getFile` needs; `message_id` locates the message it
+    arrived in, which is what makes it findable again in the chat.
+    """
+
+    file_id: str = Field(min_length=1, max_length=255)
+    message_id: Optional[int] = Field(None, ge=0)
+
+
 class VideoOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -126,9 +170,35 @@ class VideoOut(BaseModel):
     mime_type: Optional[str] = None
     checksum_sha256: Optional[str] = None
     thumbnail_url: Optional[str] = None
+
+    # Telegram mirror (instruction.txt #4).
+    telegram_file_id: Optional[str] = None
+    telegram_message_id: Optional[int] = None
+
+    # TvNa collection schema (instruction.txt #6).
+    tvna_serial: Optional[int] = None
+    source_type: Optional[str] = None
+    author_handle: Optional[str] = None
+    date_posted: Optional[str] = None
+    caption: Optional[str] = None
+    location_tag: Optional[str] = None
+    collection_method: Optional[str] = None
+    collected_by: Optional[str] = None
+    collection_date: Optional[str] = None
+
     created_by: str
     created_at: UTCDateTime
     updated_at: UTCDateTime
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def tvna_id(self) -> Optional[str]:
+        """The public TvNa identifier, e.g. "PP-001".
+
+        Derived from the integer serial so the format lives in exactly one
+        place — nothing in the database stores a "PP-" string.
+        """
+        return f"PP-{self.tvna_serial:03d}" if self.tvna_serial else None
 
 
 class TranscriptOut(BaseModel):

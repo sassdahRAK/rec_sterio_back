@@ -73,6 +73,21 @@ _ADDED_COLUMNS = (
     # fails the post-download UPDATE outright (leaving the job orphaned at
     # 'running'). `create_all` never widens an existing column, so alter it.
     "alter table videos alter column file_size type bigint",
+    # Telegram mirror (instruction.txt #4) and the TvNa collection schema (#6).
+    "alter table videos add column if not exists telegram_file_id varchar(255)",
+    "alter table videos add column if not exists telegram_message_id bigint",
+    "alter table videos add column if not exists tvna_serial integer",
+    "alter table videos add column if not exists source_type varchar(32)",
+    "alter table videos add column if not exists author_handle varchar(255)",
+    "alter table videos add column if not exists date_posted varchar(16)",
+    "alter table videos add column if not exists caption text",
+    "alter table videos add column if not exists location_tag text",
+    "alter table videos add column if not exists collection_method varchar(32)",
+    "alter table videos add column if not exists collected_by varchar(128)",
+    "alter table videos add column if not exists collection_date varchar(16)",
+    # Postgres treats NULLs as distinct in a unique index, so unfiled videos
+    # (tvna_serial IS NULL) do not collide.
+    "create unique index if not exists ix_videos_tvna_serial on videos (tvna_serial)",
 )
 
 

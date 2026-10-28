@@ -10,7 +10,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, Form, Query, Request, Response, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, text
 from sqlalchemy.orm import Session
 
 from app.access import (
@@ -34,6 +34,8 @@ from app.schemas import (
     VideoListOut,
     VideoOut,
     VideoUpdate,
+    TelegramLinkIn,
+    TvnaRecordIn,
 )
 from app.security import detect_platform, enforce_rate_limit, validate_source_url
 from app.services import asr, storage
@@ -594,3 +596,90 @@ def download_audio(
             "Content-Disposition": f'attachment; filename="{video_id}-audio.wav"',
         },
     )
+
+
+# ------------------------------------------------------------------ TvNa record
+
+
+def _allocate_tvna_serial(db: Session) -> int:
+    """The next PP-NNN number, allocated under a lock.
+
+    Two collectors recording at the same moment must not both get PP-007. The
+    advisory lock serialises the read-then-write on Postgres; the unique index
+    on `tvna_serial` is the backstop if a second process ever slips through.
+    """
+    if db.bind is not None and db.bind.dialect.name == "postgresql":
+        db.execute(text("select pg_advisory_xact_lock(hashtext('recsterio.tvna_serial'))"))
+    highest = db.execute(select(func.max(Video.tvna_serial))).scalar_one()
+    return int(highest or 0) + 1
+
+
+@router.post("/{video_id}/tvna", response_model=VideoOut)
+def record_tvna(
+    video_id: UUID,
+    payload: TvnaRecordIn,
+    db: Session = Depends(get_db),
+    principal: Principal = Depends(get_principal),
+) -> VideoOut:
+    """Attach the TvNa collection record (instruction.txt #6).
+
+    Idempotent in the sense that matters to a collector: re-recording the same
+    video updates the fields but keeps the PP-NNN number it was already given,
+    because that number is what appears in the spreadsheet and the report.
+    """
+    video = get_video_or_404(db, video_id)
+    require_video(db, video, principal, need="editor")
+
+    if video.tvna_serial is None:
+        video.tvna_serial = _allocate_tvna_serial(db)
+
+    video.location_tag = payload.location_tag.strip()
+    video.source_type = payload.source_type
+    video.collection_method = payload.collection_method
+    # Auto-detected values are kept when the collector leaves the field blank:
+    # the downloader usually knows the author and caption better than a human
+    # retyping them does.
+    if payload.author_handle:
+        video.author_handle = payload.author_handle.strip()
+    if payload.date_posted:
+        video.date_posted = payload.date_posted.strip()
+    if payload.caption:
+        video.caption = payload.caption.strip()
+    video.collected_by = (payload.collected_by or principal.actor).strip()
+    video.collection_date = (payload.collection_date or _today()).strip()
+    if payload.notes is not None:
+        video.notes = payload.notes.strip() or None
+
+    db.commit()
+    db.refresh(video)
+    return VideoOut.model_validate(video)
+
+
+def _today() -> str:
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).date().isoformat()
+
+
+@router.post("/{video_id}/telegram", response_model=VideoOut)
+def link_telegram(
+    video_id: UUID,
+    payload: TelegramLinkIn,
+    db: Session = Depends(get_db),
+    principal: Principal = Depends(get_principal),
+) -> VideoOut:
+    """Record the Telegram copy of this video (instruction.txt #4).
+
+    The bot calls this after it has uploaded the file to a chat, so the
+    catalogue knows where a re-fetchable copy lives. Only files under the
+    Bot API's 20 MB `getFile` ceiling can actually be pulled back — the column
+    records the reference either way.
+    """
+    video = get_video_or_404(db, video_id)
+    require_video(db, video, principal, need="editor")
+    video.telegram_file_id = payload.file_id.strip()
+    if payload.message_id is not None:
+        video.telegram_message_id = payload.message_id
+    db.commit()
+    db.refresh(video)
+    return VideoOut.model_validate(video)

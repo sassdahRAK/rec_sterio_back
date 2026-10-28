@@ -183,6 +183,12 @@ def handle_download(db: Session, job: Job) -> None:
         # The contract only allows the known platform values; the platform
         # detected from the URL wins unless the extractor knows it better.
         platform=result.platform if result.platform in known else video.platform,
+        # TvNa schema (instruction.txt #6). Never overwrite a value a collector
+        # has already corrected — the download is a source of defaults, not of
+        # truth.
+        author_handle=video.author_handle or result.author_handle,
+        caption=video.caption or result.caption,
+        date_posted=video.date_posted or result.date_posted,
         error=None,
     )
     _continue_chain(db, job)
