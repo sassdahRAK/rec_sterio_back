@@ -272,7 +272,18 @@ def _resolve_principal(
         select(AdminUser).where(AdminUser.email == sub)
     ).scalar_one_or_none()
     if user is None or not user.is_active:
+        # Inactive accounts stop resolving here: no token for a deactivated
+        # row is honored, whatever role its claim carries.
         raise AppError(401, "unauthorized", "Invalid or expired token.")
+    # One-line audit event when the token's role drifts from the row's role
+    # (a promotion or demotion since the token was issued). No secrets —
+    # roles and actor only; the database role is what the request runs with.
+    claim_role = payload.get("role")
+    if claim_role and claim_role != user.role:
+        logger.info(
+            "role_drift actor=%s token_role=%s database_role=%s; database wins",
+            user.email, claim_role, user.role,
+        )
     return Principal(f"{user.role}:{user.email}", user.role, user.email)
 
 

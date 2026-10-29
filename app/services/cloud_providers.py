@@ -73,10 +73,27 @@ PROVIDER_NAMES = ("google", "onedrive")
 
 
 # ---------------------------------------------------------- token encryption
+#
+# Drive refresh tokens are the one secret `drive_links` holds, so at rest they
+# are stored under AES-256-GCM from the `cryptography` package (a real AEAD:
+# random 12-byte nonce, ciphertext with its auth tag). The envelope is
+# `enc1.` + base64url(nonce || ciphertext || tag) — the `enc1.` marker is what
+# distinguishes this format from the older one below.
+#
+# Two legacy shapes can still be on disk:
+#   * rows written by the previous hand-rolled SHA-256-CTR + HMAC scheme
+#     (no marker) when CLOUD_TOKEN_KEY was set — those still decrypt through
+#     `_legacy_decrypt`, which verifies the same HMAC tag;
+#   * rows written when CLOUD_TOKEN_KEY was unset — the raw plaintext token.
+#     No key makes them readable; they fail both formats' checks and are
+#     answered with "reconnect your drive" instead of sending such a token
+#     anywhere.
+
+_ENVELOPE_MARKER = "enc1."
 
 
-def _get_fernet_key() -> Optional[bytes]:
-    """Return the Fernet key from config, or None if not configured."""
+def _get_cloud_key() -> Optional[bytes]:
+    """The 32-byte AES key decoded from CLOUD_TOKEN_KEY, or None if unset/invalid."""
     raw = (settings.cloud_token_key or "").strip()
     if not raw:
         return None
@@ -93,69 +110,130 @@ def _get_fernet_key() -> Optional[bytes]:
 
 
 def encrypt_token(plain: str) -> str:
-    """Encrypt a refresh token for storage. Returns plain if no key configured."""
-    key = _get_fernet_key()
+    """Encrypt a refresh token for storage under AES-256-GCM.
+
+    Refuses when CLOUD_TOKEN_KEY is unset (unless ALLOW_INSECURE=1 marks an
+    unsafe-by-design local deployment) — an unencrypted refresh token must
+    never be what gets written.
+    """
+    key = _get_cloud_key()
     if key is None:
-        logger.warning("CLOUD_TOKEN_KEY not set — refresh token stored unencrypted")
-        return plain
-    # Use AES-256-GCM via Python's hashlib + secrets (no cryptography package).
-    # Format: base64url(nonce:12 || ciphertext || tag:16)
+        from app.config import _insecure_allowed
+
+        if _insecure_allowed():
+            logger.warning("CLOUD_TOKEN_KEY not set — refresh token stored unencrypted (ALLOW_INSECURE)")
+            return plain
+        raise AppError(
+            400,
+            "cloud_token_key_required",
+            "The server cannot store drive tokens securely: CLOUD_TOKEN_KEY is "
+            "not configured. The operator must generate one (see the settings "
+            "comment in app/config.py) or set ALLOW_INSECURE=1 for local "
+            "development only.",
+        )
     import base64
-    import hashlib
-    import hmac
     import os
-    import struct
-    # Derive a 32-byte AES key and 16-byte MAC key from the master key
-    aes_key = hashlib.sha256(b"aes:" + key).digest()
-    mac_key = hashlib.sha256(b"mac:" + key).digest()
+
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
     nonce = os.urandom(12)
-    # XOR-stream cipher using SHA-256 counter mode (no AES hardware needed)
-    data = plain.encode()
-    # Generate keystream
-    keystream = b""
-    counter = 0
-    while len(keystream) < len(data):
-        keystream += hashlib.sha256(aes_key + nonce + struct.pack(">Q", counter)).digest()
-        counter += 1
-    ciphertext = bytes(a ^ b for a, b in zip(data, keystream[:len(data)]))
-    # HMAC-SHA256 tag over nonce + ciphertext
-    tag = hmac.new(mac_key, nonce + ciphertext, hashlib.sha256).digest()[:16]
-    payload = nonce + ciphertext + tag
-    return base64.urlsafe_b64encode(payload).decode()
+    ciphertext = AESGCM(key).encrypt(nonce, plain.encode("utf-8"), None)
+    payload = nonce + ciphertext  # ciphertext carries its 16-byte auth tag
+    return _ENVELOPE_MARKER + base64.urlsafe_b64encode(payload).decode()
 
 
-def decrypt_token(stored: str) -> str:
-    """Decrypt a stored refresh token. Returns stored value if no key configured."""
-    key = _get_fernet_key()
-    if key is None:
-        return stored
+def _legacy_decrypt(stored: str) -> Optional[str]:
+    """The old SHA-256-CTR + HMAC envelope, still readable for migration-free upgrade.
+
+    Returns None when the value is not in this envelope (bad base64, HMAC
+    mismatch, wrong length) — the caller then treats it as unusable data.
+    """
     import base64
     import hashlib
     import hmac
     import struct
+
     try:
         payload = base64.urlsafe_b64decode(stored + "==")
         if len(payload) < 12 + 16:
-            raise ValueError("too short")
+            return None
         nonce = payload[:12]
         tag = payload[-16:]
         ciphertext = payload[12:-16]
-        aes_key = hashlib.sha256(b"aes:" + key).digest()
-        mac_key = hashlib.sha256(b"mac:" + key).digest()
-        expected_tag = hmac.new(mac_key, nonce + ciphertext, hashlib.sha256).digest()[:16]
-        if not hmac.compare_digest(tag, expected_tag):
-            raise AppError(401, "cloud_auth_rejected", "Drive token integrity check failed — reconnect your drive.")
-        keystream = b""
-        counter = 0
-        while len(keystream) < len(ciphertext):
-            keystream += hashlib.sha256(aes_key + nonce + struct.pack(">Q", counter)).digest()
-            counter += 1
-        plain = bytes(a ^ b for a, b in zip(ciphertext, keystream[:len(ciphertext)]))
-        return plain.decode()
-    except AppError:
-        raise
-    except Exception as exc:
-        raise AppError(401, "cloud_auth_rejected", "Could not decrypt drive token — reconnect your drive.") from exc
+    except Exception:  # noqa: BLE001 — not our envelope at all
+        return None
+    key = _get_cloud_key()
+    if key is None:
+        return None
+    aes_key = hashlib.sha256(b"aes:" + key).digest()
+    mac_key = hashlib.sha256(b"mac:" + key).digest()
+    expected_tag = hmac.new(mac_key, nonce + ciphertext, hashlib.sha256).digest()[:16]
+    if not hmac.compare_digest(tag, expected_tag):
+        return None
+    keystream = b""
+    counter = 0
+    while len(keystream) < len(ciphertext):
+        keystream += hashlib.sha256(aes_key + nonce + struct.pack(">Q", counter)).digest()
+        counter += 1
+    plain = bytes(a ^ b for a, b in zip(ciphertext, keystream[: len(ciphertext)]))
+    try:
+        return plain.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def decrypt_token(stored: str) -> str:
+    """Decrypt a stored refresh token, or refuse.
+
+    With ALLOW_INSECURE=1 and no key configured (local dev), the stored value
+    passes through unchanged. Otherwise a value that is not a valid envelope
+    is refused — in particular the rows that were stored as raw plaintext
+    before any key existed can never be honoured silently.
+    """
+    from app.config import _insecure_allowed
+
+    key = _get_cloud_key()
+    if key is None:
+        if _insecure_allowed():
+            return stored
+        raise AppError(
+            401,
+            "cloud_auth_rejected",
+            "The server can no longer read this drive's tokens: CLOUD_TOKEN_KEY "
+            "is not configured. Reconnect your drive to restore access.",
+        )
+    raw = stored or ""
+    if raw.startswith(_ENVELOPE_MARKER):
+        import base64
+
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+        try:
+            payload = base64.urlsafe_b64decode(raw[len(_ENVELOPE_MARKER):] + "==")
+            if len(payload) < 12 + 16:
+                raise ValueError("too short")
+            nonce, ciphertext = payload[:12], payload[12:]
+            plain = AESGCM(key).decrypt(nonce, ciphertext, None)
+            return plain.decode("utf-8")
+        except AppError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — any envelope failure is "reconnect"
+            raise AppError(
+                401,
+                "cloud_auth_rejected",
+                "Drive token integrity check failed — reconnect your drive.",
+            ) from exc
+    legacy = _legacy_decrypt(raw)
+    if legacy is not None:
+        return legacy
+    # Neither envelope: a raw-plaintext-at-rest row (key never set when it was
+    # written) or corrupt data. Refuse rather than send token-like garbage to
+    # a provider.
+    raise AppError(
+        401,
+        "cloud_auth_rejected",
+        "This drive's stored token cannot be decrypted — reconnect your drive.",
+    )
 
 
 class CloudAuthError(AppError):

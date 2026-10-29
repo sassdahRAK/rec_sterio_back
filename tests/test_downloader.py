@@ -9,11 +9,14 @@ import re
 import sys
 import types
 import uuid
+from contextlib import nullcontext
 from pathlib import Path
 
 import pytest
 
 from app.config import settings
+from app.dns_pin import UnsafeHostError
+from app.errors import AppError
 from app.services.downloader import (
     DownloadError,
     TransientDownloadError,
@@ -35,6 +38,21 @@ _YTDLP_FIELDS = (
 def _clear_ytdlp_settings(monkeypatch) -> None:
     for name in _YTDLP_FIELDS:
         monkeypatch.setattr(settings, name, None)
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_fetch_guard(monkeypatch):
+    """download() re-validates the URL at fetch time with a DNS-resolving
+    guard; these option/behaviour tests are not SSRF tests and must stay
+    DNS-free (the fetch-time guard has its own tests elsewhere)."""
+    monkeypatch.setattr(
+        "app.services.downloader.assert_fetch_url_safe", lambda url: url
+    )
+    # The pin resolves the real hostname, which is never what these option /
+    # behaviour tests are about: replace it with a pass-through block.
+    monkeypatch.setattr(
+        "app.services.downloader.pin_resolved_host", lambda url: nullcontext()
+    )
 
 
 class _FakeImpersonateTarget:
@@ -351,3 +369,51 @@ def test_download_returns_a_complete_result(monkeypatch, tmp_path):
     assert result.path.exists()
     assert result.path.name == "media.mp4"
     assert result.file_size == len(b"fake media bytes for the suite")
+
+
+# --------------------------------------------------------- fetch refusal
+
+
+def test_a_blocked_fetch_is_a_permanent_download_error(monkeypatch, tmp_path):
+    """The pre-fetch guard raises AppError, which the worker does not map to a
+    permanent failure; download() must surface a permanent DownloadError."""
+    _clear_ytdlp_settings(monkeypatch)
+    _install_fake_ytdlp(monkeypatch)
+    monkeypatch.setattr(settings, "media_root", str(tmp_path))
+
+    def _blocked(url):
+        raise AppError(
+            422, "validation_failed", "source_url resolves to a private or local address."
+        )
+
+    monkeypatch.setattr("app.services.downloader.assert_fetch_url_safe", _blocked)
+
+    with pytest.raises(DownloadError) as excinfo:
+        download(TIKTOK_URL, uuid.uuid4())
+    assert not isinstance(excinfo.value, AppError)
+    message = str(excinfo.value)
+    assert "private or local" in message
+    assert "refused" in message
+    # One user-safe line: no filesystem path, no resolver/stderr detail.
+    assert str(tmp_path) not in message
+    assert "\n" not in message
+
+
+def test_an_unpinnable_host_is_a_permanent_download_error(monkeypatch, tmp_path):
+    """`pin_resolved_host` refuses a host with no public address; that must
+    reach the worker as the same permanent DownloadError, not a RuntimeError."""
+    _clear_ytdlp_settings(monkeypatch)
+    _install_fake_ytdlp(monkeypatch)
+    monkeypatch.setattr(settings, "media_root", str(tmp_path))
+
+    def _refuse(url):
+        raise UnsafeHostError("no public address")
+
+    monkeypatch.setattr("app.services.downloader.pin_resolved_host", _refuse)
+
+    with pytest.raises(DownloadError) as excinfo:
+        download(TIKTOK_URL, uuid.uuid4())
+    message = str(excinfo.value)
+    assert "private or local" in message
+    assert str(tmp_path) not in message
+    assert "\n" not in message

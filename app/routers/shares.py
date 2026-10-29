@@ -2,9 +2,17 @@
 
 A link is the low-friction option — no account, no code — so it grants a
 read-only role by default and can be revoked without touching the folder.
+
+The bare token exists exactly once: in the 201 response (and the URL it
+builds), per the API contract. At rest the row stores `sha256(token)`, so a
+database leak does not hand out live links; a presented token is hashed and
+matched against that digest. Rows written before the switch hold the
+plaintext — they are recognized lazily, kept working, and rehash-stored the
+first time they are actually used.
 """
 from __future__ import annotations
 
+import hashlib
 import secrets
 from datetime import datetime, timezone
 from uuid import UUID
@@ -30,6 +38,11 @@ def new_share_token() -> str:
     return secrets.token_urlsafe(TOKEN_BYTES)
 
 
+def token_digest(token: str) -> str:
+    """How a share token is stored: sha256 of the presented value."""
+    return hashlib.sha256(token.strip().encode("utf-8")).hexdigest()
+
+
 def _get_share(db: Session, share_id: UUID) -> ShareLink:
     share = db.get(ShareLink, share_id)
     if share is None:
@@ -38,11 +51,31 @@ def _get_share(db: Session, share_id: UUID) -> ShareLink:
 
 
 def find_active_share(db: Session, token: str) -> ShareLink | None:
-    """The share for `token`, or None when unknown, revoked or expired."""
+    """The share for `token`, or None when unknown, revoked or expired.
+
+    Lookup is by digest. A legacy row still holding the plaintext token is
+    matched by its old value and rehash-stored when it is actually active —
+    the conversion happens on successful use, so no data migration is needed
+    and a dead old link is left exactly as it was.
+    """
+    wanted = token_digest(token)
     share = db.execute(
-        select(ShareLink).where(ShareLink.token == token)
+        select(ShareLink).where(ShareLink.token == wanted)
     ).scalar_one_or_none()
-    if share is None or share.revoked_at is not None:
+    if share is None:
+        # Legacy plaintext row (pre-hash at-rest storage): match directly.
+        legacy = db.execute(
+            select(ShareLink).where(ShareLink.token == token.strip())
+        ).scalar_one_or_none()
+        if legacy is None or legacy.revoked_at is not None:
+            return None
+        if legacy.expires_at is not None and legacy.expires_at <= datetime.now(timezone.utc):
+            return None
+        # ...and convert it, now that this use is successful.
+        legacy.token = wanted
+        db.commit()
+        return legacy
+    if share.revoked_at is not None:
         return None
     if share.expires_at is not None and share.expires_at <= datetime.now(timezone.utc):
         return None
@@ -64,9 +97,12 @@ def create_share(
     folder = folder_or_404(db, folder_id)
     require_manage(db, folder, principal)
 
+    plain = new_share_token()
     share = ShareLink(
         folder_id=folder.id,
-        token=new_share_token(),
+        # Only the digest is stored; the plaintext lives in this response and
+        # the URL the caller sends out, never in the database.
+        token=token_digest(plain),
         role=payload.role,
         expires_at=payload.expires_at,
         created_by=principal.actor,
@@ -75,10 +111,10 @@ def create_share(
     db.commit()
     db.refresh(share)
     # `url` is derived, not stored, so it cannot come from `model_validate(share)`.
-    return ShareLinkCreated(
-        **ShareLinkOut.model_validate(share).model_dump(),
-        url=share_url(share.token),
-    )
+    out = ShareLinkOut.model_validate(share)
+    # The one response that reveals the bare token (contract §Share links).
+    out.token = plain
+    return ShareLinkCreated(**out.model_dump(), url=share_url(plain))
 
 
 @router.get("/folders/{folder_id}/shares", response_model=list[ShareLinkOut])

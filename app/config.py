@@ -12,6 +12,60 @@ from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 
 
+class ConfigError(RuntimeError):
+    """The deployment would run with placeholder bootstrap secrets.
+
+    Raised at settings-load time so `python -m app.worker`, `uvicorn` and the
+    test bootstrap all hit the same wall: a default SECRET_KEY signs JWTs
+    anyone with this repository can forge, a default ADMIN_PASSWORD is a
+    public credential, and a default BOT_API_TOKEN hands the whole
+    service-auth surface to whoever found it on GitHub.
+    """
+
+
+# Values a fresh checkout yields when the operator never set the env var.
+# These are the strings the boot guard refuses in production.
+PLACEHOLDER_DEFAULTS: dict[str, tuple[str, str]] = {
+    #                env name      (field,             placeholder)
+    "SECRET_KEY": ("secret_key", "change-me-to-a-long-random-string"),
+    "ADMIN_PASSWORD": ("admin_password", "change-me"),
+    "BOT_API_TOKEN": ("bot_api_token", "replace-me-with-a-shared-service-token"),
+}
+
+
+def _insecure_allowed() -> bool:
+    """The explicit escape hatch for local development and the test suite."""
+    return (os.environ.get("ALLOW_INSECURE") or "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def validate_security_settings(s: Settings) -> None:
+    """Refuse placeholders for SECRET_KEY / ADMIN_PASSWORD / BOT_API_TOKEN.
+
+    ALLOW_INSECURE=1 bypasses the guard for local dev and tests; anything else
+    (including the var being absent) enforces it. Unset (`""`) counts as
+    insecure too — the placeholder check above names the defaults, and an
+    empty value disables the mechanism without ever being intended.
+    """
+    if _insecure_allowed():
+        return
+    offenders: list[str] = []
+    for env_name, (field_name, placeholder) in PLACEHOLDER_DEFAULTS.items():
+        value = (getattr(s, field_name) or "").strip()
+        if not value or value == placeholder:
+            offenders.append(env_name)
+    if offenders:
+        listed = "; ".join(offenders)
+        raise ConfigError(
+            "Refusing to start with insecure bootstrap settings: "
+            f"{listed} {'is' if len(offenders) == 1 else 'are'} still unset "
+            "or the default placeholder. Set real values for each, or set "
+            "ALLOW_INSECURE=1 only for local development. Offending vars: "
+            f"{', '.join(sorted(offenders))}."
+        )
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=(str(BACKEND_DIR / ".env"), str(BACKEND_DIR.parent / ".env"), ".env"),
@@ -126,6 +180,23 @@ class Settings(BaseSettings):
     video_create_rate_window: int = 60  # seconds
     login_rate_limit: int = 10
     login_rate_window: int = 60
+    # Passcode / share-link redemption is the public brute-force surface: a
+    # visitor gets a bounded number of guesses, keyed per IP and target.
+    public_redeem_rate_limit: int = 15
+    public_redeem_rate_window: int = 60
+    # Most recent live passcodes a single redemption verifies (bcrypt runs are
+    # the cost unit: a wrong guess pays one per candidate, so this bounds the
+    # CPU an unauthenticated caller can burn in one request).
+    public_redeem_scan_limit: int = Field(default=100, ge=1, le=1000)
+    # Where the rate limiter gets the caller's address (app.security.client_ip).
+    # Default False: this process faces the client directly, so
+    # `request.client.host` is the only address a caller cannot forge — any
+    # client-supplied header (`X-Forwarded-For`...) is ignored. Set True ONLY
+    # behind a same-host TLS-terminating proxy (the deploy compose's Caddy):
+    # `request.client.host` is then the proxy for every visitor, and the real
+    # client is read from the LAST hop of `X-Forwarded-For` — the one hop a
+    # proxy on the same box wrote; every earlier hop was typed by the client.
+    trust_proxy_headers: bool = False
     ffmpeg_timeout_seconds: int = 600
 
     @field_validator("cors_origins", mode="before")
@@ -159,6 +230,9 @@ class Settings(BaseSettings):
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     s = Settings()
+    # The guard runs before the app (API *or* worker) can sign or accept
+    # anything with a placeholder secret.
+    validate_security_settings(s)
     s.ensure_dirs()
     return s
 

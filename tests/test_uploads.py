@@ -11,11 +11,14 @@ from sqlalchemy import select
 
 from app.db import SessionLocal
 from app.models import Job, Video
+from tests.helpers import media_bytes
 
 
 def _mp4_bytes() -> bytes:
-    """A small, unique fake media payload. The upload path never decodes it."""
-    return b"\x00\x00\x00\x18ftypmp42" + b"recsterio-upload-fixture" * 40
+    """A small, unique payload with real container bytes (the upload route's
+    ffprobe gate refuses header-only fakes: the upload path never decodes the
+    file, but the container still has to be one)."""
+    return media_bytes()
 
 
 def test_upload_creates_a_downloaded_video_and_queues_audio(client, auth_headers):
@@ -43,9 +46,11 @@ def test_upload_creates_a_downloaded_video_and_queues_audio(client, auth_headers
 
 
 def test_upload_without_transcription_queues_no_transcribe(client, auth_headers):
+    # Uploads are sniffed by their magic bytes and probed by ffprobe, so the
+    # payload must be a decodable mp3 container, not just an ID3 tag.
     resp = client.post(
         "/api/v1/videos/upload",
-        files={"file": ("a.mp3", b"audio-bytes-x" * 10, "audio/mpeg")},
+        files={"file": ("a.mp3", media_bytes(".mp3"), "audio/mpeg")},
         data={"start_transcription": "false"},
         headers=auth_headers,
     )
@@ -107,7 +112,10 @@ def test_upload_rejects_an_empty_file(client, auth_headers):
 def test_upload_falls_back_to_the_suffix_for_a_generic_content_type(client, auth_headers):
     resp = client.post(
         "/api/v1/videos/upload",
-        files={"file": ("clip.mp4", b"payload-generic-type", "application/octet-stream")},
+        # Content sniffing runs independently of the declared mime type, so the
+        # bytes still need the real mp4 header even though curl would send
+        # octet-stream.
+        files={"file": ("clip.mp4", _mp4_bytes(), "application/octet-stream")},
         headers=auth_headers,
     )
     assert resp.status_code == 201, resp.text

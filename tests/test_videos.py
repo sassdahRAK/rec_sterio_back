@@ -178,23 +178,20 @@ def test_get_video_detail_includes_transcripts_and_jobs(client, auth_headers):
     assert body["jobs"][0]["kind"] == "download"
 
 
-def test_video_detail_masks_local_path_to_a_filename(client, auth_headers):
-    """The stored local_path is a server path; the API must not leak it.
-
-    Only an upload (or a finished download) sets local_path, so the test goes
-    through the upload flow and then reads the detail endpoint.
-    """
+def test_video_detail_does_not_expose_local_path(client, auth_headers):
+    """The stored local_path is a server path and is not API surface at all now
+    (even basename-only was a mapping for guessing the storage layout); media
+    streams through /videos/{id}/media instead."""
     video = upload_video(client, auth_headers)
     resp = client.get(f"/api/v1/videos/{video['id']}", headers=auth_headers)
     assert resp.status_code == 200
-    local_path = resp.json()["local_path"]
-    # A bare filename: no directory components, same extension as the upload.
-    assert local_path
-    assert "/" not in local_path
-    assert local_path.endswith(".mp4")
+    assert "local_path" not in resp.json()
 
 
 def test_patch_video_updates_fields(client, auth_headers):
+    """Metadata fields are editor-writable; `status` is not (the queue/runner
+    and the ingestion routes own the lifecycle), so a PATCH carrying it is
+    ignored for that field rather than poking the pipeline."""
     video = client.post("/api/v1/videos", json={"source_url": URL}, headers=auth_headers).json()
     resp = client.patch(
         f"/api/v1/videos/{video['id']}",
@@ -205,7 +202,8 @@ def test_patch_video_updates_fields(client, auth_headers):
     body = resp.json()
     assert body["title"] == "New title"
     assert body["notes"] == "note"
-    assert body["status"] == "quarantined"
+    # The lifecycle state stays exactly what ingestion set it to.
+    assert body["status"] == "pending"
 
 
 def test_delete_video_removes_rows_and_media(client, auth_headers):

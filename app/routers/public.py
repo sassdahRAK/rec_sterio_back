@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Optional
 from uuid import UUID
 
-from fastapi import APIRouter, BackgroundTasks, Depends, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, Query, Request
 from fastapi.responses import FileResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -36,6 +36,7 @@ from app.schemas import (
     PublicFolderOut,
     ShareRedeem,
 )
+from app.security import client_ip, enforce_rate_limit
 from app.services import storage, zip_export
 from app.services.storage import cloud_storage_available
 from app.services.zip_export import safe_name
@@ -43,8 +44,6 @@ from app.services.zip_export import safe_name
 router = APIRouter(prefix="/public", tags=["public"])
 
 CARD_PREVIEW_CHARS = 240
-
-
 
 
 def _video_cards(db: Session, folder: Folder) -> list[DataCardOut]:
@@ -221,11 +220,29 @@ def download_folder_zip(
 @router.post("/passcodes/redeem", response_model=GuestTokenResponse)
 def redeem_passcode_code(
     payload: PasscodeRedeem,
+    request: Request,
     db: Session = Depends(get_db),
 ) -> GuestTokenResponse:
     """Open a private folder with its passcode and receive a scoped token."""
     from app.routers.passcodes import redeem_passcode
 
+    # Redemption is the public guess surface: the code space is small enough
+    # that an unthrottled visitor could walk it. Keyed per IP and per target
+    # (folder id, typed folder name, or "any"), so one visitor cannot exhaust
+    # another's attempts by hammering a different folder.
+    # The key must be the same string the lookup matches on: `redeem_passcode`
+    # compares folder names with `.strip().lower()`, so "Secret", "secret " and
+    # "SECRET" all hit the same rows and must share one bucket — otherwise a
+    # caller mints a fresh throttle by re-spelling the target.
+    if payload.folder_id:
+        target = str(payload.folder_id)
+    else:
+        target = (payload.folder_name or "").strip().lower() or "any"
+    enforce_rate_limit(
+        f"redeem:passcode:{client_ip(request)}:{target}",
+        settings.public_redeem_rate_limit,
+        settings.public_redeem_rate_window,
+    )
     folder = redeem_passcode(
         db,
         payload.code,
@@ -250,11 +267,21 @@ def redeem_passcode_code(
 def redeem_share_token(
     token: str,
     payload: ShareRedeem,
+    request: Request,
     db: Session = Depends(get_db),
 ) -> GuestTokenResponse:
     """Open a folder through a share link and receive a scoped token."""
     from app.routers.shares import find_active_share
 
+    # Same throttle as passcode redemption. It keys on the CLIENT IP only:
+    # the token itself is an unguessable secret, so per-token buckets would
+    # let a guesser spread attempts across fresh keys — the repeatable target
+    # here is the caller, not the link.
+    enforce_rate_limit(
+        f"redeem:share:{client_ip(request)}",
+        settings.public_redeem_rate_limit,
+        settings.public_redeem_rate_window,
+    )
     share = find_active_share(db, token)
     if share is None:
         # Same answer as an unknown link: a dead link reveals nothing.

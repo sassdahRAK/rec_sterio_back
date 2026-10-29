@@ -12,7 +12,7 @@ import pytest
 
 from app.db import SessionLocal
 from app.models import ShareLink
-from app.routers.shares import find_active_share, folder_for_share, share_url
+from app.routers.shares import find_active_share, folder_for_share, share_url, token_digest
 from tests.helpers import ensure_user, make_folder, user_headers
 
 
@@ -107,6 +107,7 @@ def test_creating_a_share_on_an_unknown_folder_is_a_404(client, auth_headers):
 
 
 def test_list_shares_returns_them_newest_first(client, auth_headers):
+    """Newest first — and NOT the bare tokens: only the 201 reveals those."""
     folder = make_folder(client, auth_headers, name="Dataset")
     first = _make_share(client, auth_headers, folder["id"])
     second = _make_share(client, auth_headers, folder["id"])
@@ -114,8 +115,11 @@ def test_list_shares_returns_them_newest_first(client, auth_headers):
     resp = client.get(f"/api/v1/folders/{folder['id']}/shares", headers=auth_headers)
     assert resp.status_code == 200
     tokens = [s["token"] for s in resp.json()]
-    assert tokens[0] == second["token"]
-    assert tokens[1] == first["token"]
+    # The stored rows carry the sha256 digest, not the redeemable secret, so
+    # a read-side leak would be a digest at worst.
+    assert tokens[0] == token_digest(second["token"])
+    assert tokens[1] == token_digest(first["token"])
+    assert tokens[0] != second["token"]
 
 
 def test_listing_shares_requires_manage(client, auth_headers):
@@ -133,11 +137,13 @@ def test_listing_shares_requires_manage(client, auth_headers):
 
 
 def test_describe_share_labels_a_link_before_it_is_sent(client, auth_headers):
+    """The preview never hands out the redeemable token again (201-only rule):
+    it answers with the stored digest."""
     folder = make_folder(client, auth_headers, name="Dataset")
     share = _make_share(client, auth_headers, folder["id"])
     resp = client.get(f"/api/v1/shares/{share['id']}", headers=auth_headers)
     assert resp.status_code == 200
-    assert resp.json()["token"] == share["token"]
+    assert resp.json()["token"] == token_digest(share["token"])
 
 
 def test_describe_unknown_share_is_a_404(client, auth_headers):

@@ -41,7 +41,12 @@ from app.schemas import (
     TvnaRecordIn,
 )
 from app.roles import ADMIN_TIER, LIBRARY_VIEW_ROLES
-from app.security import detect_platform, enforce_rate_limit, validate_source_url
+from app.security import (
+    client_ip,
+    detect_platform,
+    enforce_rate_limit,
+    validate_source_url,
+)
 from app.services import asr, cloud_providers, storage, zip_export
 from app.services.cloud_providers import decrypt_token
 from app.services.actors import display_name
@@ -52,13 +57,6 @@ logger = logging.getLogger("recsterio.videos")
 router = APIRouter(prefix="/videos", tags=["videos"])
 
 SORTABLE = {"created_at", "-created_at", "title", "-title"}
-
-
-def _client_ip(request: Request) -> str:
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    return request.client.host if request.client else "unknown"
 
 
 def _dedupe_scope(db: Session, principal: Principal):
@@ -124,6 +122,23 @@ def _telegram_person_scope(db: Session, principal: Principal):
         if public:
             conditions.append(Video.folder_id.in_(public))
     return or_(*conditions)
+
+
+def _can_report_collision(db: Session, existing: Video, principal: Principal) -> bool:
+    """Whether the 409 body may carry the existing video at all.
+
+    The de-duplication *filter* limits which rows a collision is even reported
+    against, but the library tiers (developer/reviewer) are deliberately
+    scope-less there — global idempotency — and that would leak a private
+    folder's video (title, id, source_url, local path) through the 409 body.
+    So the body applies the same visibility predicate the list/detail views
+    use for this exact role context (`access.video_role`): a caller who could
+    open the video gets it echoed; anyone else gets a generic conflict. The
+    Telegram service identity is the operator actor and keeps the full body.
+    """
+    if principal.role == "telegram" and principal.actor == "telegram:bot":
+        return True
+    return video_role(db, existing, principal) is not None
 
 
 def _lock_on_source_url(db: Session, source_url: str) -> None:
@@ -260,7 +275,7 @@ def create_video(
     principal: Principal = Depends(get_principal),
 ) -> VideoOut:
     enforce_rate_limit(
-        f"video_create:{_client_ip(request)}",
+        f"video_create:{client_ip(request)}",
         settings.video_create_rate_limit,
         settings.video_create_rate_window,
     )
@@ -287,24 +302,33 @@ def create_video(
         stmt = stmt.where(scope)
     existing = db.execute(stmt).scalars().first()
     if existing is not None:
+        # The existing row is echoed back only when THIS caller could open it
+        # (same predicate as list/detail): a global idempotency check must not
+        # become a metadata oracle for rows in private folders.
+        if _can_report_collision(db, existing, principal):
+            raise AppError(
+                409,
+                "conflict",
+                # A teammate pasting a link that is already in the dataset should
+                # land on the existing unit, so the message says so and the id is
+                # in `details` for the client to open it.
+                "This link is already in the dataset. Open the existing unit instead of "
+                "downloading it again.",
+                [
+                    {
+                        "field": "source_url",
+                        "issue": "duplicate_video",
+                        "video_id": str(existing.id),
+                    }
+                ],
+                # The existing resource is returned alongside the error envelope so
+                # clients do not have to create a duplicate.
+                extra={"video": VideoOut.model_validate(existing).model_dump(mode="json")},
+            )
         raise AppError(
             409,
             "conflict",
-            # A teammate pasting a link that is already in the dataset should
-            # land on the existing unit, so the message says so and the id is
-            # in `details` for the client to open it.
-            "This link is already in the dataset. Open the existing unit instead of "
-            "downloading it again.",
-            [
-                {
-                    "field": "source_url",
-                    "issue": "duplicate_video",
-                    "video_id": str(existing.id),
-                }
-            ],
-            # The existing resource is returned alongside the error envelope so
-            # clients do not have to create a duplicate.
-            extra={"video": VideoOut.model_validate(existing).model_dump(mode="json")},
+            "This link is already in the dataset.",
         )
 
     # TikTok/Facebook answer an anonymous server with a bot check, so a new
@@ -371,6 +395,107 @@ def _safe_suffix(filename: str | None) -> str:
     return suffix if suffix in ALLOWED_UPLOAD_SUFFIXES else ""
 
 
+# Container families, by the magic bytes that define them. A suffix belongs to
+# exactly one family; the uploaded bytes must speak the same language as the
+# name they were given.
+_EBML_MAGIC = b"\x1a\x45\xdf\xa3"  # Matroska / WebM
+
+
+def _sniff_family(head: bytes) -> str:
+    """A coarse container family id from the first bytes, or '' when unknown."""
+    # ISOBMFF: the `ftyp` box is usually the very first box (at offset 4), but
+    # a couple of muxers/cameras lead with a padding box — accept the marker
+    # anywhere in the first 64 bytes instead of pinning it to one offset.
+    if len(head) >= 8 and b"ftyp" in head[:64]:
+        return "isombx"  # mp4 / m4v / m4a / mov (ISO base media)
+    if head[:4] == _EBML_MAGIC:
+        return "ebml"  # webm / mkv
+    if head[:4] == b"RIFF" and head[8:12] == b"WAVE":
+        return "wav"
+    if head[:4] == b"RIFF" and head[8:12] == b"AVI ":
+        return "avi"
+    if head[:4] == b"fLaC":
+        return "flac"
+    if head[:4] == b"OggS":
+        return "ogg"  # ogg / opus
+    if head[:3] == b"ID3":
+        return "mpeg-audio"  # mp3 / aac with a tag
+    if len(head) >= 2 and head[0] == 0xFF and (head[1] & 0xE0) == 0xE0:
+        return "mpeg-audio"  # bare MPEG/ADTS frames (mp3 / aac)
+    return ""
+
+
+_SUFFIX_FAMILY = {
+    ".mp4": "isombx",
+    ".m4v": "isombx",
+    ".m4a": "isombx",
+    ".mov": "isombx",
+    ".webm": "ebml",
+    ".mkv": "ebml",
+    ".avi": "avi",
+    ".wav": "wav",
+    ".mp3": "mpeg-audio",
+    ".aac": "mpeg-audio",
+    ".flac": "flac",
+    ".ogg": "ogg",
+    ".opus": "ogg",
+}
+
+
+def _magic_mismatch(suffix: str, head: bytes) -> bool:
+    """True when the first bytes contradict an allowed suffix (or are too small).
+
+    A file whose bytes cannot even start a media header is not media, whatever
+    its name says — an HTML upload page or a PHP payload renamed .mp4 must not
+    reach ffmpeg. The header probe needs 8 bytes (the smallest magic the table
+    speaks, `ftyp` at offset 4 or MPEG frame sync); anything ffmpeg itself can
+    still read but with a different layout than the magic table (a rare exotic
+    container) is deferred to the ffprobe check below rather than rejected here.
+    """
+    if suffix not in _SUFFIX_FAMILY:
+        return True
+    if len(head) < 8:
+        return True
+    family = _sniff_family(head)
+    return family == "" or family != _SUFFIX_FAMILY[suffix]
+
+
+def _probe_rejects(path: Path) -> bool:
+    """ffprobe (when present) settles what the header only claimed.
+
+    The magic-byte table can be fooled: a text body headed with valid `ftyp`
+    bytes is an "mp4" to the table and garbage to every decoder. When ffprobe
+    runs and refuses the bytes (`Invalid data`) or names a container outside
+    the allowed set, the upload loses. Only an *absent* ffprobe stays
+    best-effort (the header table did the work), like `asr.probe_duration`.
+    """
+    import shutil
+    import subprocess
+
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return False
+    try:
+        proc = subprocess.run(
+            [ffprobe, "-v", "error", "-show_entries", "format=format_name", "-of", "csv=p=0",
+             str(path)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=60,
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    formats = proc.stdout.decode("utf-8", "replace").strip().lower()
+    allowed = ("mp4", "mov", "m4a", "3gp", "3g2", "mj2", "matroska", "webm", "avi",
+               "wav", "mp3", "aac", "adts", "flac", "ogg", "opus", "amr")
+    if proc.returncode != 0:
+        # ffprobe ran and refused the bytes: not a container this pipeline
+        # will ever process, no matter what the header claimed.
+        return True
+    return bool(formats) and not any(name in formats for name in allowed)
+
+
 @router.post("/upload", response_model=VideoOut, status_code=201)
 async def upload_video(
     request: Request,
@@ -390,7 +515,7 @@ async def upload_video(
     extraction, transcription) behind it.
     """
     enforce_rate_limit(
-        f"video_create:{_client_ip(request)}",
+        f"video_create:{client_ip(request)}",
         settings.video_create_rate_limit,
         settings.video_create_rate_window,
     )
@@ -449,6 +574,24 @@ async def upload_video(
                 chunk = await file.read(1024 * 1024)
                 if not chunk:
                     break
+                if written == 0 and _magic_mismatch(suffix, chunk):
+                    # Type check by content, not just by name: the extension
+                    # and the actual bytes must agree before ffmpeg ever
+                    # touches the file.
+                    raise AppError(
+                        415,
+                        "unsupported_media_type",
+                        "The file's contents do not match the file type it was "
+                        "named. Upload an audio or video file.",
+                        [
+                            {
+                                "field": "file",
+                                "issue": "content_mismatch",
+                                "filename": file.filename,
+                                "allowed": sorted(ALLOWED_UPLOAD_SUFFIXES),
+                            }
+                        ],
+                    )
                 written += len(chunk)
                 if written > limit_bytes:
                     raise AppError(
@@ -485,13 +628,17 @@ async def upload_video(
     duplicate = db.execute(stmt).scalars().first()
     if duplicate is not None:
         _discard_upload(db, video, dest)
-        raise AppError(
-            409,
-            "conflict",
-            "This file has already been uploaded.",
-            [{"field": "file", "issue": "duplicate_video", "video_id": str(duplicate.id)}],
-            extra={"video": VideoOut.model_validate(duplicate).model_dump(mode="json")},
-        )
+        # Same redaction rule as the link dedupe: only a caller who could open
+        # the existing video receives it in the 409 body.
+        if _can_report_collision(db, duplicate, principal):
+            raise AppError(
+                409,
+                "conflict",
+                "This file has already been uploaded.",
+                [{"field": "file", "issue": "duplicate_video", "video_id": str(duplicate.id)}],
+                extra={"video": VideoOut.model_validate(duplicate).model_dump(mode="json")},
+            )
+        raise AppError(409, "conflict", "This file has already been uploaded.")
 
     video.checksum_sha256 = checksum
     video.file_size = written
@@ -504,6 +651,26 @@ async def upload_video(
     else:
         video.mime_type = declared_type
     video.duration_seconds = asr.probe_duration(dest)
+    # Second gate: when ffprobe is installed and definitely names the container
+    # something outside the allowed media set, the bytes lose despite passing
+    # the magic-byte table. A probe that cannot run or cannot parse stays a
+    # no-op (same best-effort rule as `probe_duration`).
+    if _probe_rejects(dest):
+        _discard_upload(db, video, dest)
+        raise AppError(
+            415,
+            "unsupported_media_type",
+            "The file's contents are not an audio or video file. Upload an "
+            "audio or video file.",
+            [
+                {
+                    "field": "file",
+                    "issue": "unsupported_container",
+                    "filename": file.filename,
+                    "allowed": sorted(ALLOWED_UPLOAD_SUFFIXES),
+                }
+            ],
+        )
     video.status = "downloaded"
     video.progress = 100
 

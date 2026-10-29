@@ -11,6 +11,10 @@ bcrypt>=4.1
 PyJWT>=2.8
 python-multipart>=0.0.9
 httpx>=0.27
+# Real AEAD (AES-256-GCM) for drive refresh tokens at rest — the hand-rolled
+# predecessor (SHA-256-CTR + HMAC) is retired; app/services/cloud_providers.py
+# imports `cryptography.hazmat.primitives.ciphers.aead.AESGCM`.
+cryptography>=42
 
 # video download (feature 1)
 yt-dlp[default]>=2024.8

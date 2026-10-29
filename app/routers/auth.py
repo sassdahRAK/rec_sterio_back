@@ -30,18 +30,11 @@ from app.schemas import (
     TelegramLinkOut,
     TelegramLinkStatusOut,
 )
-from app.security import enforce_rate_limit
+from app.security import client_ip, enforce_rate_limit
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 GOOGLE_TOKENINFO_URL = "https://oauth2.googleapis.com/tokeninfo"
-
-
-def _client_ip(request: Request) -> str:
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    return request.client.host if request.client else "unknown"
 
 
 @router.post("/login", response_model=LoginResponse)
@@ -51,7 +44,7 @@ def login(
     db: Session = Depends(get_db),
 ) -> LoginResponse:
     enforce_rate_limit(
-        f"login:{_client_ip(request)}",
+        f"login:{client_ip(request)}",
         settings.login_rate_limit,
         settings.login_rate_window,
     )
@@ -111,7 +104,7 @@ def google_login(
             "Google sign-in is not configured on this server. Set GOOGLE_CLIENT_ID.",
         )
     enforce_rate_limit(
-        f"login:{_client_ip(request)}",
+        f"login:{client_ip(request)}",
         settings.login_rate_limit,
         settings.login_rate_window,
     )

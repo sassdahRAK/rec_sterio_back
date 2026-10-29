@@ -64,7 +64,12 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
-    allow_credentials=True,
+    # Auth is a bearer header, never a cookie (both frontends send
+    # `Authorization`), so credentialed CORS is dead surface area: with it
+    # set, `*` origins are the only thing FastAPI refuses, and a pinned
+    # origin list invites cookie-bearing cross-site calls there is no use
+    # case for. Flipping it costs the browsers nothing.
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["Content-Range", "Accept-Ranges", "Content-Length", "Retry-After"],

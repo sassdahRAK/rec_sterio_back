@@ -70,6 +70,7 @@ from sqlalchemy import text  # noqa: E402
 from app.auth import seed_admin_user  # noqa: E402
 from app.db import Base, SessionLocal, engine  # noqa: E402
 from app.main import app  # noqa: E402
+from app.security import rate_limiter  # noqa: E402
 
 
 @pytest.fixture(scope="session")
@@ -118,6 +119,9 @@ def clean_database(client):
             "bot_users",
         ):
             conn.execute(text(f"delete from {table}"))
+    # The limiter is process-wide and in-memory: without this every test shares
+    # one "testclient" bucket and later tests start already throttled.
+    rate_limiter.reset()
     # The per-user cookies files live on disk, outside the database wipe.
     for name in os.listdir(_COOKIES_ROOT):
         os.unlink(os.path.join(_COOKIES_ROOT, name))

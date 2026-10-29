@@ -34,7 +34,14 @@ def _admin(client) -> dict:
 
 @pytest.fixture
 def drive_config(monkeypatch):
-    """Pretend both OAuth apps are configured, without touching the real env."""
+    """Pretend both OAuth apps are configured, without touching the real env.
+
+    Drive tokens must be stored under an encryption key (an unset key refuses
+    the connect flow in production), so the tests configure a real one and
+    exercise the actual AESGCM encrypt/decrypt path with it.
+    """
+    import base64
+
     from app.config import settings
 
     monkeypatch.setattr(settings, "google_client_id", "g-id")
@@ -42,6 +49,9 @@ def drive_config(monkeypatch):
     monkeypatch.setattr(settings, "onedrive_client_id", "m-id")
     monkeypatch.setattr(settings, "onedrive_client_secret", "m-secret")
     monkeypatch.setattr(settings, "drive_oauth_redirect", "http://localhost/cb")
+    monkeypatch.setattr(
+        settings, "cloud_token_key", base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
+    )
     return settings
 
 

@@ -14,7 +14,9 @@ from typing import Callable, Optional
 from uuid import UUID
 
 from app.config import settings
-from app.security import detect_platform
+from app.dns_pin import UnsafeHostError, pin_resolved_host
+from app.errors import AppError
+from app.security import assert_fetch_url_safe, detect_platform
 from app.services import storage
 
 logger = logging.getLogger("recsterio.downloader")
@@ -184,7 +186,21 @@ def download(
     `cookiefile` is the requesting user's own cookies export (per-user
     session). When it exists it wins over every server-side session setting;
     yt-dlp would otherwise merge the operator's jar with the user's.
+
+    The URL is re-validated here, at the fetch step, with the fail-closed
+    guard (`assert_fetch_url_safe`): create-time validation happened long
+    before this request runs, and a DNS record may have been flipped since.
     """
+    try:
+        assert_fetch_url_safe(source_url)
+    except AppError as exc:
+        # The guard raises AppError(422), which the worker does not translate
+        # into a permanent job failure. A blocked fetch is permanent: report it
+        # as such, with one user-safe line (no paths, no resolver internals).
+        raise DownloadError(
+            "The source URL resolves to a private or local network address, "
+            "so the fetch was refused."
+        ) from exc
     outdir = storage.video_dir(video_id)
     reporter = ProgressReporter(on_progress)
 
@@ -233,40 +249,54 @@ def download(
                 path,
             )
 
-    ydl = _build_ydl(opts)
     try:
-        with ydl:
-            info = ydl.extract_info(source_url, download=True)
-    except Exception as exc:  # yt-dlp raises DownloadError / ExtractorError
-        message = str(exc)
-        lowered = message.lower()
-        platform = detect_platform(source_url)
-        if any(marker in lowered for marker in PROTECTED_MARKERS):
-            raise DownloadError(
-                "This content is protected, private or otherwise not publicly "
-                f"available: {_first_line(message)}"
-            ) from exc
-        if "requested format is not available" in lowered:
-            raise TransientDownloadError(
-                "No usable media format was offered by the server. The content may "
-                "be protected or region-locked."
-            ) from exc
-        # A 429 is the site throttling this server, not refusing it: retrying
-        # later is the correct response, so check it before the permanent
-        # bot-block markers.
-        if any(marker in lowered for marker in RATE_LIMIT_MARKERS):
-            raise TransientDownloadError(
-                f"the site is rate-limiting this server; the job will retry with "
-                f"backoff: {_first_line(message)}"
-            ) from exc
-        # A bot check is permanent for this configuration: retrying the same
-        # request from the same IP produces the same wall. Say what fixes it.
-        if any(marker in lowered for marker in BLOCK_MARKERS):
-            raise DownloadError(
-                f"{platform.capitalize() if platform != 'unknown' else 'The site'} "
-                f"blocked this request: {_first_line(message)}. {_block_hint(platform)}"
-            ) from exc
-        raise TransientDownloadError(f"Download failed: {_first_line(message)}") from exc
+        with pin_resolved_host(source_url):
+            # Constructing yt-dlp and fetching metadata both resolve the host,
+            # so both run under the pin: the metadata request may only reach an
+            # address that was public when the guard ran.
+            ydl = _build_ydl(opts)
+            try:
+                with ydl:
+                    info = ydl.extract_info(source_url, download=True)
+            except Exception as exc:  # yt-dlp raises DownloadError / ExtractorError
+                message = str(exc)
+                lowered = message.lower()
+                platform = detect_platform(source_url)
+                if any(marker in lowered for marker in PROTECTED_MARKERS):
+                    raise DownloadError(
+                        "This content is protected, private or otherwise not publicly "
+                        f"available: {_first_line(message)}"
+                    ) from exc
+                if "requested format is not available" in lowered:
+                    raise TransientDownloadError(
+                        "No usable media format was offered by the server. The content may "
+                        "be protected or region-locked."
+                    ) from exc
+                # A 429 is the site throttling this server, not refusing it: retrying
+                # later is the correct response, so check it before the permanent
+                # bot-block markers.
+                if any(marker in lowered for marker in RATE_LIMIT_MARKERS):
+                    raise TransientDownloadError(
+                        f"the site is rate-limiting this server; the job will retry with "
+                        f"backoff: {_first_line(message)}"
+                    ) from exc
+                # A bot check is permanent for this configuration: retrying the same
+                # request from the same IP produces the same wall. Say what fixes it.
+                if any(marker in lowered for marker in BLOCK_MARKERS):
+                    raise DownloadError(
+                        f"{platform.capitalize() if platform != 'unknown' else 'The site'} "
+                        f"blocked this request: {_first_line(message)}. {_block_hint(platform)}"
+                    ) from exc
+                raise TransientDownloadError(
+                    f"Download failed: {_first_line(message)}"
+                ) from exc
+    except UnsafeHostError as exc:
+        # The pin could not resolve a public address: same permanent, user-safe
+        # refusal as a blocked pre-fetch guard.
+        raise DownloadError(
+            "The source URL resolves to a private or local network address, "
+            "so the fetch was refused."
+        ) from exc
 
     if not info:
         raise TransientDownloadError("Downloader returned no metadata.")
@@ -274,6 +304,24 @@ def download(
     path = _resolve_output_path(outdir, info)
     if path is None or not path.exists():
         raise TransientDownloadError("Download completed but no media file was produced.")
+
+    # Redirect hops happen inside yt-dlp, so the final hop cannot be blocked
+    # before it is taken. This is the "re-validate every hop" backstop: where
+    # the fetch actually ended must also be a public address, otherwise the
+    # bytes are discarded — a redirect must never smuggle private content in.
+    final_url = str(info.get("url") or info.get("final_url") or "").strip()
+    if final_url:
+        try:
+            assert_fetch_url_safe(final_url)
+        except AppError as exc:
+            try:
+                path.unlink()
+            except OSError:
+                logger.warning("could not remove redirected-download output %s", path)
+            raise DownloadError(
+                "The download was redirected to a private or local network "
+                "address, so the fetched file was discarded."
+            ) from exc
 
     sha = storage.sha256_file(path)
     return DownloadResult(

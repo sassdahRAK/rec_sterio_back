@@ -1,8 +1,8 @@
 """Pydantic v2 request/response models. snake_case everywhere."""
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Annotated, Any, Dict, List, Literal, Optional
 from uuid import UUID
 
@@ -31,6 +31,31 @@ UTCDateTime = Annotated[
 ]
 
 # ---------------------------------------------------------------- segments
+
+# Technical error text (ffmpeg stderr, Python tracebacks of a failed step) is
+# useful to an operator but must not become a filesystem/machine oracle at the
+# API boundary: absolute paths, argv fragments and multi-line stderr dumps are
+# reduced to a one-line, path-free reason.
+_WIN_PATH_RE = re.compile(r"[A-Za-z]:[\\/][^\s\"']*[\\/][^\s\"']*[^\s\"'.,;:)!}?]*")
+_UNIX_PATH_RE = re.compile(r"(?<![:\w])/[^\s\"']*/[^\s\"']*[^\s\"'.,;:)!}?]*")
+
+
+def sanitize_technical_error(value: Optional[str], limit: int = 300) -> Optional[str]:
+    """One line, no absolute paths, bounded length; short human reasons pass.
+
+    Applied where a `error`/`last_error`-style field leaves the schema layer:
+    the stored value may contain a path and stderr lines (they help the
+    operator debug), while responses keep a readable reason only.
+    """
+    if value is None:
+        return None
+    first = next((ln.strip() for ln in str(value).splitlines() if ln.strip()), "")
+    line = " ".join(first.split()) or str(value).strip()
+    line = _WIN_PATH_RE.sub("[path]", line)
+    line = _UNIX_PATH_RE.sub("[path]", line)
+    if len(line) > limit:
+        line = line[: limit - 1].rstrip() + "…"
+    return line or None
 
 
 class Segment(BaseModel):
@@ -201,6 +226,18 @@ class UserPatchIn(BaseModel):
         return None if value is None else _known_role(value)
 
 
+class UserDeleteIn(BaseModel):
+    """Confirmation the account holder supplies with `DELETE /users/me`.
+
+    Deleting yourself while still owning folders takes those folders out of
+    management, so an account with owned folders must send `{"confirm": true}`
+    to have them handed to the seeded operator first. Without it the deletion
+    is refused with a 409.
+    """
+
+    confirm: bool = False
+
+
 class DriveLinkOut(BaseModel):
     """One connected personal cloud. Never carries the refresh token."""
 
@@ -286,9 +323,17 @@ class VideoCreate(BaseModel):
 
 
 class VideoUpdate(BaseModel):
+    """The fields an editor may change on a video row.
+
+    `status` is deliberately NOT editor-writable: the processing lifecycle is
+    owned by the queue/runner and the ingestion routes, and a hand-poked
+    status (a "failed" row claimed transcribed) breaks the pipeline's
+    assumptions. A caller who needs a stuck row moving again uses
+    `POST /videos/{id}/retry`, which resets it properly.
+    """
+
     title: Optional[str] = None
     notes: Optional[str] = None
-    status: Optional[str] = None
     folder_id: Optional[UUID] = None
     position: Optional[int] = None
 
@@ -350,7 +395,9 @@ class VideoOut(BaseModel):
     status: str
     progress: int
     error: Optional[str] = None
-    local_path: Optional[str] = None
+    # `local_path` is deliberately NOT exposed: the stored column names the
+    # server's media directory, which is not something an API response should
+    # disclose even basename-only. Clients stream through /videos/{id}/media.
     file_size: Optional[int] = None
     duration_seconds: Optional[float] = None
     mime_type: Optional[str] = None
@@ -388,15 +435,14 @@ class VideoOut(BaseModel):
     # on exactly this video.
     can_open: bool = True
 
-    @field_validator("local_path")
+    @field_validator("error")
     @classmethod
-    def _mask_local_path(cls, v: Optional[str]) -> Optional[str]:
-        """The model column stores a full server path; the API must not reveal
-        where media lives on disk, so responses carry only the filename.
-        Inherited by VideoDetailOut, which does not redeclare the field."""
-        if not v:
-            return v
-        return Path(v).name
+    def _sanitize_error(cls, v: Optional[str]) -> Optional[str]:
+        """The stored value may carry absolute paths, argv and multi-line
+        stderr from a failed step; the response keeps a one-line, path-free
+        human reason. Inherited by VideoDetailOut (and list rows), so every
+        video error an API caller sees passes through here."""
+        return sanitize_technical_error(v)
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -428,6 +474,14 @@ class TranscriptOut(BaseModel):
     created_at: UTCDateTime
     updated_at: UTCDateTime
 
+    @field_validator("error")
+    @classmethod
+    def _sanitize_error(cls, v: Optional[str]) -> Optional[str]:
+        """Same boundary rule as `VideoOut.error`: the stored step error may
+        carry paths and stderr lines; `GET /videos/{id}` embeds transcripts
+        (`VideoDetailOut`), so a failed version must not leak them either."""
+        return sanitize_technical_error(v)
+
 
 class JobOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -445,6 +499,14 @@ class JobOut(BaseModel):
     started_at: Optional[UTCDateTime] = None
     finished_at: Optional[UTCDateTime] = None
     created_at: UTCDateTime
+
+    @field_validator("last_error")
+    @classmethod
+    def _sanitize_last_error(cls, v: Optional[str]) -> Optional[str]:
+        """Same boundary rule as `VideoOut.error`: `GET /videos/{id}` embeds
+        jobs (`VideoDetailOut`) and the stored value carries worker stderr,
+        argv and file paths — the response keeps a one-line human reason."""
+        return sanitize_technical_error(v)
 
 
 class VideoDetailOut(VideoOut):
@@ -525,6 +587,14 @@ class MergeOut(BaseModel):
     error: Optional[str] = None
     created_at: UTCDateTime
     updated_at: UTCDateTime
+
+    @field_validator("error")
+    @classmethod
+    def _sanitize_error(cls, v: Optional[str]) -> Optional[str]:
+        """Same boundary rule as `VideoOut.error`: the worker stores
+        `str(exc)[:2000]`, which can carry a path or ffmpeg stderr; the
+        response keeps a one-line, path-free reason."""
+        return sanitize_technical_error(v)
 
 
 class MergeListOut(BaseModel):

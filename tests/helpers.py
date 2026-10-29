@@ -7,18 +7,73 @@ rather than forged, so a test cannot pass by bypassing the signing path.
 """
 from __future__ import annotations
 
+import os
+import shutil
+import subprocess
+import tempfile
+from functools import lru_cache
 from uuid import uuid4
 
 from app.auth import create_access_token, issue_folder_token, issue_guest_token
 
 
-def media_bytes() -> bytes:
-    """A real file payload, unique per call.
+@lru_cache(maxsize=None)
+def real_container_prefix(suffix: str) -> bytes:
+    """The first bytes of a genuine container, built once per suffix by ffmpeg.
+
+    The upload route's ffprobe gate refuses bytes that no decoder can parse,
+    so a fixture that fakes only the magic header would now be rejected. A
+    short real encoding (0.2 s, tiny) is made once per suffix and truncated
+    after its moov/metadata boxes: faststart puts them at the front, so the
+    truncated prefix still probes cleanly and the unique filler below keeps
+    every payload's sha256 distinct (uploads dedupe on the checksum).
+    Returns b'' when ffmpeg is unavailable; the synthetic fallback applies and
+    the (absent) ffprobe gate stays inert.
+    """
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return b""
+    encoders = {
+        ".mp4": ["-f", "lavfi", "-i", "color=c=black:s=64x64:d=0.2",
+                 "-f", "lavfi", "-i", "anullsrc=r=8000:cl=mono:d=0.2",
+                 "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+                 "-c:a", "aac", "-b:a", "24k", "-movflags", "+faststart"],
+        ".mp3": ["-f", "lavfi", "-i", "anullsrc=r=8000:cl=mono:d=0.2"],
+    }
+    args = encoders.get(suffix)
+    if args is None:
+        return b""
+    fd, path = tempfile.mkstemp(prefix="recsterio-fixture-", suffix=suffix)
+    os.close(fd)
+    try:
+        proc = subprocess.run(
+            [ffmpeg, "-hide_banner", "-loglevel", "error", *args, "-y", path],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60, check=False,
+        )
+        if proc.returncode != 0:
+            return b""
+        keep = 4096 if suffix == ".mp4" else 1024
+        with open(path, "rb") as f:
+            return f.read(keep)
+    finally:
+        os.unlink(path)
+
+
+def media_bytes(suffix: str = ".mp4") -> bytes:
+    """A real container payload, unique per call.
 
     Ingestion dedupes on sha256, so a constant payload would make every upload
-    after the first a 409.
+    after the first a 409 — the unique filler appended after the container's
+    leading boxes takes care of that (the same trick makes each uploaded file
+    a fresh checksum while the bytes stay a decodable container).
     """
-    return b"\x00\x00\x00\x18ftypmp42" + uuid4().hex.encode() * 16
+    prefix = real_container_prefix(suffix)
+    filler = uuid4().hex.encode() * 16
+    if prefix:
+        return prefix + filler
+    # No ffmpeg: fake header bytes (no ffprobe to catch them, either).
+    magics = {".mp4": b"\x00\x00\x00\x18ftypmp42", ".mp3": b"ID3\x00\x07"}
+    return magics.get(suffix, b"ftyp-fallback") + filler
 
 
 # Kept for tests that assert on the raw payload.
