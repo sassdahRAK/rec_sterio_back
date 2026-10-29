@@ -11,12 +11,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.db import SessionLocal
 from app.models import Job, Merge, Transcript, Video
+from app.schemas import sanitize_technical_error
 from app.services import asr as asr_service
 from app.services import downloader, gemini as gemini_service, storage
 from app.services.merger import (
@@ -34,6 +35,36 @@ class PermanentJobError(Exception):
     """The job can never succeed as-is (protected content, missing config...)."""
 
 
+class JobDeferred(Exception):
+    """The handler is waiting for another job; re-queue without burning a try.
+
+    A merge that has no Whisper/Gemini transcript yet must not fail: it stays
+    pending and this job is scheduled to run again shortly.
+    """
+
+    def __init__(self, reason: str, delay_seconds: float = 30.0) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.delay_seconds = delay_seconds
+
+
+# A merge may poll for its input transcripts for a bounded time (30s * 120 =
+# one hour at the default delay) before it is treated as a real failure.
+MAX_MERGE_DEFERS = 120
+MERGE_DEFER_SECONDS = 30.0
+
+# A waiting merge records *why* on its own row (`Merge.error` is surfaced by
+# MergeOut), otherwise the console shows an unexplained pending merge. One
+# line, bounded, path-free — the same rule the API applies to step errors.
+MERGE_WAIT_ERROR_LIMIT = 300
+
+_WHISPER_KINDS = ("extract_audio", "transcribe")
+
+# Payload keys a chained job must carry forward: the chain only records the
+# next `kind`, but the merge job needs to know which `merges` row it belongs to.
+_CHAIN_CONTEXT_KEYS = ("merge_id", "base_transcript_id", "gemini_transcript_id", "model")
+
+
 # --------------------------------------------------------------------------
 # helpers
 # --------------------------------------------------------------------------
@@ -41,6 +72,17 @@ class PermanentJobError(Exception):
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def lock_video(db: Session, video_id: UUID) -> None:
+    """Take the video's row lock for the rest of the transaction.
+
+    Transcript versions are allocated as ``max(version) + 1``; there is no
+    unique constraint on (video_id, version), so two concurrent writers could
+    otherwise pick the same number. Serialising on the parent video row makes
+    the read-then-insert atomic without a schema change.
+    """
+    db.execute(select(Video.id).where(Video.id == video_id).with_for_update())
 
 
 def next_version(db: Session, video_id: UUID) -> int:
@@ -51,6 +93,12 @@ def next_version(db: Session, video_id: UUID) -> int:
         .limit(1)
     ).scalar_one_or_none()
     return (current or 0) + 1
+
+
+def allocate_version(db: Session, video_id: UUID) -> int:
+    """Next transcript version, safe against concurrent writers for the video."""
+    lock_video(db, video_id)
+    return next_version(db, video_id)
 
 
 def find_identical_transcript(
@@ -79,7 +127,7 @@ def create_transcript(
 ) -> Transcript:
     transcript = Transcript(
         video_id=video_id,
-        version=next_version(db, video_id),
+        version=allocate_version(db, video_id),
         source=source,
         language=language,
         content=content,
@@ -105,6 +153,11 @@ def _continue_chain(db: Session, job: Job) -> None:
     nxt = chain[0]
     remaining = chain[1:]
     payload: Dict[str, Any] = {"chain": remaining}
+    # Carry the merge context forward, otherwise the chained merge job would
+    # create a second `merges` row and leave the original one pending forever.
+    for key in _CHAIN_CONTEXT_KEYS:
+        if key in (job.payload or {}):
+            payload[key] = job.payload[key]
     video_id = job.video_id
     queue.enqueue(db, nxt, video_id=video_id, payload=payload, priority=job.priority)
 
@@ -183,11 +236,14 @@ def handle_download(db: Session, job: Job) -> None:
     if video is None:
         raise PermanentJobError("Video no longer exists.")
 
+    queue.ensure_not_cancelled(db, job)
+
     # Idempotency: the file may already be on disk from an earlier run.
     existing = storage.find_media_file(video.id)
     if existing and video.checksum_sha256:
         current_sha = storage.sha256_file(existing)
         if current_sha == video.checksum_sha256:
+            queue.ensure_not_cancelled(db, job)
             _set_video(db, video, status="downloaded", progress=100, local_path=str(existing))
             _continue_chain(db, job)
             return
@@ -221,6 +277,10 @@ def handle_download(db: Session, job: Job) -> None:
     except downloader.DownloadError as exc:
         raise PermanentJobError(str(exc)) from exc
 
+    # A download cancelled mid-flight must not mark the video downloaded, write
+    # the media metadata or chain the audio/transcription jobs.
+    queue.ensure_not_cancelled(db, job)
+
     known = {"youtube", "tiktok", "facebook", "instagram"}
     _set_video(
         db,
@@ -252,9 +312,12 @@ def handle_extract_audio(db: Session, job: Job) -> None:
     video = db.get(Video, job.video_id) if job.video_id else None
     if video is None:
         raise PermanentJobError("Video no longer exists.")
+    queue.ensure_not_cancelled(db, job)
     audio = _ensure_audio(db, video)
     # Best-effort listening copy; failures inside are logged, never fatal.
     _ensure_mp3(db, video)
+    # Cancelled during extraction: no status change and no chained job.
+    queue.ensure_not_cancelled(db, job)
     # Only move to "transcribing" when a transcription job actually follows.
     # An extract-only request (upload with start_transcription=false) has an
     # empty chain, and setting "transcribing" would strand the video there
@@ -271,6 +334,7 @@ def handle_transcribe(db: Session, job: Job) -> None:
     video = db.get(Video, job.video_id) if job.video_id else None
     if video is None:
         raise PermanentJobError("Video no longer exists.")
+    queue.ensure_not_cancelled(db, job)
     audio = _ensure_audio(db, video)
 
     try:
@@ -281,6 +345,11 @@ def handle_transcribe(db: Session, job: Job) -> None:
     seg_rows = [s.to_dict() for s in segments]
     content = " ".join(s.text.strip() for s in segments if s.text.strip())
     language = _overall_language(seg_rows)
+
+    # Last checkpoint before the irreversible write: a job cancelled while the
+    # ASR ran must not create a transcript version, advance video.status or
+    # chain the next job.
+    queue.ensure_not_cancelled(db, job)
 
     existing = find_identical_transcript(db, video.id, content, source="whisper")
     if existing is not None:
@@ -304,6 +373,7 @@ def handle_gemini_transcribe(db: Session, job: Job) -> None:
     video = db.get(Video, job.video_id) if job.video_id else None
     if video is None:
         raise PermanentJobError("Video no longer exists.")
+    queue.ensure_not_cancelled(db, job)
     audio = _ensure_audio(db, video)
 
     client = gemini_service.GeminiClient()
@@ -318,6 +388,10 @@ def handle_gemini_transcribe(db: Session, job: Job) -> None:
     seg_rows = [s.to_dict() for s in segments]
     content = " ".join(s.text.strip() for s in segments if s.text.strip())
     language = _overall_language(seg_rows)
+
+    # Same rule as the Whisper handler: no write, status change or chained job
+    # for a job cancelled while Gemini ran.
+    queue.ensure_not_cancelled(db, job)
 
     existing = find_identical_transcript(db, video.id, content, source="gemini")
     if existing is None:
@@ -367,10 +441,118 @@ def _latest_ready_transcript(
     return db.execute(stmt.order_by(Transcript.version.desc()).limit(1)).scalars().first()
 
 
+def _has_active_job(db: Session, video_id: UUID, kinds: Sequence[str]) -> bool:
+    """Is work of one of these kinds already queued/running for the video?"""
+    row = db.execute(
+        select(Job.id)
+        .where(
+            Job.video_id == video_id,
+            Job.kind.in_(tuple(kinds)),
+            Job.status.in_(("queued", "running")),
+        )
+        .limit(1)
+    ).first()
+    return row is not None
+
+
+def _last_finished_job(db: Session, video_id: UUID, kinds: Sequence[str]):
+    """Newest finished job of these kinds (status, last_error), or None.
+
+    Ordered by when it finished, not when it was created: a job that was
+    retried later must not be shadowed by an older attempt.
+    """
+    return db.execute(
+        select(Job.status, Job.last_error)
+        .where(
+            Job.video_id == video_id,
+            Job.kind.in_(tuple(kinds)),
+            Job.status.in_(("succeeded", "failed", "dead")),
+        )
+        .order_by(
+            func.coalesce(Job.finished_at, Job.created_at).desc(),
+            Job.created_at.desc(),
+        )
+        .limit(1)
+    ).first()
+
+
+def _dependency_state(
+    db: Session, video_id: UUID, kinds: Sequence[str]
+) -> tuple[str, Optional[str]]:
+    """Where the pass a merge needs stands: active / failed / succeeded / missing.
+
+    ``failed`` is terminal: nothing will run that pass again on its own, so the
+    merge must not enqueue a fresh copy every defer round (one stuck merge used
+    to spawn a failed job per round). A still-queued pass that is retrying an
+    earlier failure reports that failure as its ``last_error`` so the merge can
+    say why it is waiting.
+    """
+    active = _has_active_job(db, video_id, kinds)
+    row = _last_finished_job(db, video_id, kinds)
+    if active:
+        retrying = row is not None and row[0] in ("failed", "dead")
+        return "active", row[1] if retrying else None
+    if row is None:
+        return "missing", None
+    if row[0] in ("failed", "dead"):
+        return "failed", row[1]
+    return "succeeded", None
+
+
+def _merge_wait_message(piece: str, last_error: Optional[str] = None) -> str:
+    """One-line `Merge.error` for a merge that is waiting on `piece`."""
+    detail = sanitize_technical_error(last_error, MERGE_WAIT_ERROR_LIMIT)
+    message = f"Waiting for {piece}"
+    if detail:
+        message = f"{message}, which last failed: {detail}"
+    return sanitize_technical_error(message, MERGE_WAIT_ERROR_LIMIT) or message
+
+
+def _merge_dependency_failed(pass_name: str, last_error: Optional[str]) -> str:
+    """Permanent reason: the pass this merge needs has already failed."""
+    detail = sanitize_technical_error(last_error, MERGE_WAIT_ERROR_LIMIT) or "no further detail"
+    return (
+        sanitize_technical_error(
+            f"Merge failed: the {pass_name} transcript pass failed and will not be retried: {detail}",
+            MERGE_WAIT_ERROR_LIMIT,
+        )
+        or f"Merge failed: the {pass_name} transcript pass failed."
+    )
+
+
+def _defer_merge(
+    db: Session,
+    job: Job,
+    merge_row: Merge,
+    reason: str,
+    last_error: Optional[str] = None,
+) -> None:
+    """Leave the merge pending and ask the queue to run this job again later."""
+    payload = dict(job.payload or {})
+    defers = int(payload.get("_defers") or 0) + 1
+    if defers > MAX_MERGE_DEFERS:
+        raise PermanentJobError(
+            f"Merge gave up after waiting for {reason}. Check the worker logs."
+        )
+    payload["_defers"] = defers
+    job.payload = payload
+    # Contract statuses are pending|running|ready|failed: a merge waiting for
+    # its inputs is back to `pending` (it has not run successfully yet). The
+    # reason travels with the row so the console does not show a bare pending.
+    merge_row.status = "pending"
+    merge_row.error = _merge_wait_message(reason, last_error)
+    db.flush()
+    raise JobDeferred(reason, MERGE_DEFER_SECONDS)
+
+
 def handle_merge(db: Session, job: Job) -> None:
     video = db.get(Video, job.video_id) if job.video_id else None
     if video is None:
         raise PermanentJobError("Video no longer exists.")
+
+    # Cheap checkpoint first: the row may have been cancelled between claim and
+    # handler start (a cancel sets job.status=failed + last_error=cancelled).
+    queue.ensure_not_cancelled(db, job)
 
     payload = job.payload or {}
     merge_row: Optional[Merge] = None
@@ -380,6 +562,18 @@ def handle_merge(db: Session, job: Job) -> None:
         merge_row = Merge(video_id=video.id, status="running", model=settings.gemini_model)
         db.add(merge_row)
         db.flush()
+        # Remember the row on the job: a chained merge (`engine=both`) arrives
+        # without a merge_id, and without this every deferred re-run would
+        # create another `merges` row and strand the previous one at pending.
+        payload = dict(payload)
+        payload["merge_id"] = str(merge_row.id)
+        job.payload = payload
+    else:
+        # Re-read the row: another session may have cancelled this merge while
+        # the job sat in the queue. A cancelled merge is terminal.
+        db.refresh(merge_row)
+        if merge_row.status == "failed" and merge_row.error == queue.CANCELLED_MARKER:
+            raise queue.JobCancelled(f"merge {merge_row.id} was cancelled")
 
     merge_row.status = "running"
     merge_row.error = None
@@ -388,30 +582,65 @@ def handle_merge(db: Session, job: Job) -> None:
     base = None
     if payload.get("base_transcript_id"):
         base = db.get(Transcript, UUID(str(payload["base_transcript_id"])))
+        if base is not None and (base.video_id != video.id or base.status != "ready"):
+            base = None
     if base is None:
         base = _latest_ready_transcript(db, video.id, source="whisper")
     if base is None:
         base = _latest_ready_transcript(db, video.id, exclude_source="gemini")
     if base is None:
-        raise PermanentJobError(
-            "No base transcript to merge - generate a Whisper transcript first."
+        # `engine=both` starts Whisper and Gemini in parallel; Gemini may finish
+        # first. Never merge against a missing base: make sure Whisper work is
+        # queued and wait for it instead of failing the merge.
+        whisper_state, whisper_error = _dependency_state(db, video.id, _WHISPER_KINDS)
+        if whisper_state == "failed":
+            # Re-enqueueing here is exactly the storm: every round would create
+            # another extract/transcribe pair that fails the same way.
+            raise PermanentJobError(
+                _merge_dependency_failed("Whisper", whisper_error)
+            )
+        if whisper_state != "active":
+            queue.enqueue(
+                db,
+                "extract_audio",
+                video_id=video.id,
+                payload={"chain": ["transcribe"]},
+                priority=80,
+            )
+        _defer_merge(
+            db, job, merge_row, "the Whisper transcript", whisper_error
         )
 
     gem = None
     if payload.get("gemini_transcript_id"):
         gem = db.get(Transcript, UUID(str(payload["gemini_transcript_id"])))
+        if gem is not None and (gem.video_id != video.id or gem.status != "ready"):
+            gem = None
     if gem is None or gem.id == base.id:
         gem = _latest_ready_transcript(db, video.id, source="gemini")
     if gem is not None and gem.id == base.id:
         gem = None
     if gem is None:
-        raise PermanentJobError(
-            "No Gemini transcript to merge - run the Gemini transcription first."
-        )
-    if gem.id == base.id:
-        raise PermanentJobError(
-            "Base and Gemini transcripts resolve to the same version; "
-            "generate an independent Gemini transcript first."
+        # The contract: "If gemini_transcript_id is omitted, the worker uses the
+        # most recent source=gemini transcript, or generates one." Generate it
+        # and wait rather than failing the merge.
+        gemini_state, gemini_error = _dependency_state(db, video.id, ("gemini_transcribe",))
+        if gemini_state == "failed":
+            # No API key is the normal case: a permanent Gemini failure used to
+            # be re-enqueued every 30 s for an hour (~120 failed jobs).
+            raise PermanentJobError(
+                _merge_dependency_failed("Gemini", gemini_error)
+            )
+        if gemini_state != "active":
+            queue.enqueue(
+                db,
+                "gemini_transcribe",
+                video_id=video.id,
+                payload={"chain": []},
+                priority=80,
+            )
+        _defer_merge(
+            db, job, merge_row, "the Gemini transcript", gemini_error
         )
 
     merge_row.base_transcript_id = base.id
@@ -423,22 +652,15 @@ def handle_merge(db: Session, job: Job) -> None:
         segments_from_rows(base.segments), segments_from_rows(gem.segments)
     )
     diff = merge_result_to_diff(result)
+    # Last checkpoint: an operator may have cancelled while the merge ran. The
+    # cancelled job and merge row must not be flipped to succeeded/ready.
+    queue.ensure_not_cancelled(db, job)
     merge_row.diff = diff
     merge_row.status = "ready"
     merge_row.error = None
-
-    merged = find_identical_transcript(db, video.id, result.content, source="merged")
-    if merged is None:
-        merged = create_transcript(
-            db,
-            video.id,
-            source="merged",
-            content=result.content,
-            segments=result.segments,
-            language=base.language or gem.language,
-            created_by="merged",
-        )
-    merge_row.merged_transcript_id = merged.id
+    # The merged transcript itself is created by POST /merges/{id}/apply, which
+    # allocates the version at promotion time. Creating one here would make
+    # "apply" either a no-op or a duplicate version.
     _set_video(db, video, status="transcribed", error=None)
     db.flush()
 
@@ -464,6 +686,19 @@ def run_job(db: Session, job: Job) -> None:
         return
     try:
         handler(db, job)
+    except queue.JobCancelled as exc:
+        # The operator cancelled this job mid-flight. `queue.cancel` already
+        # wrote the terminal state; discard this handler's partial writes and
+        # leave the job cancelled (never succeeded/failed).
+        logger.info("job %s (%s) stopped: %s", job.id, job.kind, exc)
+        db.rollback()
+        return
+    except JobDeferred as exc:
+        # Waiting on another job (a merge waiting for its transcripts):
+        # re-queue without counting the round as a failure.
+        logger.info("job %s (%s) deferred: %s", job.id, job.kind, exc.reason)
+        queue.defer(db, job, exc.reason, exc.delay_seconds)
+        return
     except PermanentJobError as exc:
         logger.warning("job %s (%s) failed permanently: %s", job.id, job.kind, exc)
         _fail_running_merge_rows(db, job, str(exc))

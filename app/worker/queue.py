@@ -22,9 +22,37 @@ logger = logging.getLogger("recsterio.queue")
 # be reclaimed (worker crash / restart safety).
 STALE_RUNNING_SECONDS = 1800
 
+# `jobs.status` has no dedicated terminal state for an operator cancellation
+# (the frozen contract lists queued/running/succeeded/failed/dead), so a
+# cancelled job is `failed` with this marker in `last_error`. Every other
+# writer treats that pair as terminal: once it is set, a handler that is still
+# running may no longer flip the row to succeeded/failed/dead.
+CANCELLED_MARKER = "cancelled"
+
+# Statuses a job can still legitimately transition out of.
+ACTIVE_STATUSES = ("queued", "running")
+
+
+class JobCancelled(Exception):
+    """Raised when a running handler notices the operator cancelled its job."""
+
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def ensure_not_cancelled(db: Session, job: Job) -> None:
+    """Checkpoint for long handlers: stop before writing more work.
+
+    Reads the job row straight from the database (a column query bypasses the
+    session identity map) so a cancel committed by another session is visible
+    even though this handler's in-memory ``job`` still says ``running``.
+    """
+    row = db.execute(
+        select(Job.status, Job.last_error).where(Job.id == job.id)
+    ).one_or_none()
+    if row is not None and row[0] == "failed" and row[1] == CANCELLED_MARKER:
+        raise JobCancelled(f"job {job.id} was cancelled")
 
 
 def enqueue(
@@ -93,53 +121,109 @@ def backoff_seconds(attempts: int) -> int:
 
 
 def succeed(db: Session, job: Job) -> None:
-    job.status = "succeeded"
-    job.finished_at = utcnow()
-    job.last_error = None
+    """Mark the job succeeded, unless it was cancelled while the handler ran.
+
+    The transition is a conditional UPDATE on the database row, not an
+    assignment on the (possibly stale) in-memory object: a cancel committed by
+    another session during a long handler wins, and the handler's completion
+    can no longer overwrite it.
+    """
+    db.execute(
+        update(Job)
+        .where(Job.id == job.id, Job.status.in_(ACTIVE_STATUSES))
+        .values(status="succeeded", finished_at=utcnow(), last_error=None)
+        .execution_options(synchronize_session=False)
+    )
     db.commit()
+    db.refresh(job)
 
 
 def fail(db: Session, job: Job, error: str, permanent: bool = False) -> Job:
     """Record a failure; requeue with exponential backoff or mark the job dead."""
-    job.last_error = error[:4000]
-    job.finished_at = utcnow()
+    values: Dict[str, Any] = {
+        "last_error": error[:4000],
+        "finished_at": utcnow(),
+    }
     if permanent:
         # Not retryable on its own (protected content, missing credentials...).
-        job.status = "failed"
+        values["status"] = "failed"
     elif job.attempts < job.max_attempts:
-        job.status = "queued"
-        job.scheduled_at = utcnow() + timedelta(seconds=backoff_seconds(job.attempts))
+        values["status"] = "queued"
+        values["scheduled_at"] = utcnow() + timedelta(seconds=backoff_seconds(job.attempts))
     else:
-        job.status = "dead"
+        values["status"] = "dead"
+    # Guarded like succeed(): a cancelled job is already terminal and must not
+    # be requeued, marked dead or have its error overwritten.
+    db.execute(
+        update(Job)
+        .where(Job.id == job.id, Job.status.in_(ACTIVE_STATUSES))
+        .values(**values)
+        .execution_options(synchronize_session=False)
+    )
     db.commit()
+    db.refresh(job)
+    return job
+
+
+def defer(
+    db: Session, job: Job, reason: str, delay_seconds: float = 30.0
+) -> Job:
+    """Re-queue an active job without counting the round as a failure.
+
+    A handler that is waiting for another job (a merge waiting for the Whisper
+    or Gemini transcript) returns control this way: the job stays claimable
+    after ``delay_seconds`` and its terminal-state bookkeeping is untouched.
+    """
+    db.execute(
+        update(Job)
+        .where(Job.id == job.id, Job.status.in_(ACTIVE_STATUSES))
+        .values(
+            status="queued",
+            scheduled_at=utcnow() + timedelta(seconds=delay_seconds),
+            last_error=reason[:4000],
+            finished_at=None,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    db.commit()
+    db.refresh(job)
     return job
 
 
 def cancel(db: Session, job: Job) -> Job:
-    job.status = "failed"
-    job.last_error = "cancelled"
-    job.finished_at = utcnow()
+    """Cancel a job; the terminal state survives whatever the handler does next."""
+    db.execute(
+        update(Job)
+        .where(Job.id == job.id, Job.status.in_(ACTIVE_STATUSES))
+        .values(
+            status="failed",
+            last_error=CANCELLED_MARKER,
+            finished_at=utcnow(),
+        )
+        .execution_options(synchronize_session=False)
+    )
     # A cancelled merge must not leave its `merges` row stuck at 'running'
     # forever — there would be no way to recover it from the dashboard.
     if job.kind == "merge" and job.video_id:
         from app.models import Merge
 
-        rows = (
-            db.execute(
-                select(Merge).where(
-                    Merge.video_id == job.video_id,
-                    Merge.status.in_(("pending", "running")),
-                )
-            )
-            .scalars()
-            .all()
+        stmt = update(Merge).where(
+            Merge.video_id == job.video_id,
+            Merge.status.in_(("pending", "running")),
         )
-        for row in rows:
-            row.status = "failed"
-            row.error = "cancelled"
-        if rows:
-            db.flush()
+        merge_id = (job.payload or {}).get("merge_id")
+        if merge_id:
+            try:
+                stmt = stmt.where(Merge.id == UUID(str(merge_id)))
+            except (TypeError, ValueError):
+                pass
+        db.execute(
+            stmt.values(status="failed", error=CANCELLED_MARKER).execution_options(
+                synchronize_session=False
+            )
+        )
     db.commit()
+    db.refresh(job)
     return job
 
 
