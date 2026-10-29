@@ -199,6 +199,12 @@ class Settings(BaseSettings):
     trust_proxy_headers: bool = False
     ffmpeg_timeout_seconds: int = 600
 
+    # ---- delivery compression (P3) ----
+    compress_threshold_mb: int = 50     # originals at or under this skip compression
+    compress_target_mb: int = 48        # the ladder stops at the first result under this
+    # Wall-clock ceiling for one ffmpeg compress rung; the ladder may run more.
+    compression_timeout_seconds: int = 1800
+
     @field_validator("cors_origins", mode="before")
     @classmethod
     def _split_origins(cls, v):

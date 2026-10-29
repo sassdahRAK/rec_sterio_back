@@ -354,6 +354,145 @@ def extract_mp3(
     return out_path
 
 
+def compress_video(
+    media_path: Path,
+    out_path: Path,
+    *,
+    height: Optional[int],
+    crf: int,
+    maxrate_kbps: Optional[int] = None,
+    timeout_seconds: int | None = None,
+) -> Path:
+    """Encode a smaller mp4 copy of `media_path` for *delivery only*.
+
+    The compressed file exists to be sent to a chat: it is never an input to
+    the ASR pipeline. `extract_audio` / `extract_mp3` / `transcribe` always read
+    the original media, so a delivery compression can never change a
+    transcript. The worker's quality ladder picks `height`/`crf`.
+
+    `height=None` keeps the source resolution (the ladder only scales down,
+    never up). `maxrate_kbps` caps the video bitrate — the rate-starved-source
+    case, where CRF alone could output more bytes than the original carries.
+
+    ffmpeg, with timeout; work happens in a temp dir so a failed run leaves no
+    partial file at `out_path`.
+    """
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg is not installed on the server.")
+
+    timeout = timeout_seconds or settings.ffmpeg_timeout_seconds
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    # Work in a temp dir first so a failed run never leaves a truncated mp4 behind.
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_out = Path(tmpdir) / "compressed.mp4"
+        cmd = [
+            ffmpeg,
+            "-nostdin",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(media_path),
+        ]
+        if height is not None:
+            cmd += ["-vf", f"scale=-2:{height}"]
+        cmd += ["-c:v", "libx264", "-crf", str(crf)]
+        if maxrate_kbps is not None:
+            # Ceiling, not target: CRF still picks the quality, the cap only
+            # keeps the output from outgrowing the original's bitrate.
+            cmd += [
+                "-maxrate",
+                f"{maxrate_kbps}k",
+                "-bufsize",
+                f"{maxrate_kbps * 2}k",
+            ]
+        cmd += [
+            "-preset",
+            "veryfast",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-movflags",
+            "+faststart",
+            str(tmp_out),
+        ]
+        try:
+            proc = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"ffmpeg timed out after {timeout}s while compressing the video."
+            ) from exc
+        if proc.returncode != 0 or not tmp_out.exists():
+            stderr = (proc.stderr or b"").decode("utf-8", "replace").strip()
+            raise RuntimeError(f"ffmpeg failed to compress the video: {stderr[:400]}")
+        shutil.copyfile(tmp_out, out_path)
+    return out_path
+
+
+def probe_media_video(media_path: Path) -> tuple[Optional[int], Optional[float]]:
+    """(video height, duration seconds) as ffprobe sees them, or (None, None).
+
+    The delivery ladder needs both to size its rungs (scale only downward, cap
+    the bitrate from the original's own). Best effort: a missing ffprobe or an
+    unreadable file only loses the estimate, never raises.
+    """
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe or not media_path.exists():
+        return None, None
+    try:
+        proc = subprocess.run(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=height",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "csv=p=0",
+                str(media_path),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None, None
+    if proc.returncode != 0:
+        return None, None
+    lines = [ln.strip() for ln in proc.stdout.decode("utf-8", "replace").splitlines() if ln.strip()]
+    height: Optional[int] = None
+    duration: Optional[float] = None
+    for line in lines:
+        parts = line.split(",")
+        for part in parts:
+            part = part.strip()
+            if part.isdigit():
+                if height is None:
+                    height = int(part)
+                else:
+                    height = max(height, int(part))
+            else:
+                try:
+                    duration = duration if duration is not None else float(part)
+                except ValueError:
+                    pass
+    return height, duration
+
+
 def audio_duration(audio_path: Path) -> Optional[float]:
     """Duration of a wav file, read from the header (no ffprobe needed)."""
     try:

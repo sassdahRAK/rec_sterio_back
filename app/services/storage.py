@@ -14,6 +14,8 @@ from app.config import settings
 AUDIO_FILENAME = "audio.wav"
 AUDIO_MP3_FILENAME = "audio.mp3"
 MEDIA_STEM = "media"
+# Delivery-only copy for sending to a chat; never an ASR input.
+COMPRESSED_STEM = "compressed"
 
 
 def media_root() -> Path:
@@ -62,6 +64,19 @@ def find_media_file(video_id: UUID | str) -> Optional[Path]:
     for p in sorted(d.iterdir()):
         if p.is_file() and p.stem == MEDIA_STEM and p.suffix.lower() == ".cloud-tmp":
             return p
+    return None
+
+
+def compressed_media_file(video_id: UUID | str) -> Path:
+    """The delivery-only mp4 (a chat-sized copy of the original media)."""
+    return video_dir(video_id) / f"{COMPRESSED_STEM}.mp4"
+
+
+def find_compressed_file(video_id: UUID | str) -> Optional[Path]:
+    """The compressed delivery copy if it exists on disk, else None."""
+    path = media_root() / str(video_id) / f"{COMPRESSED_STEM}.mp4"
+    if path.is_file():
+        return path
     return None
 
 

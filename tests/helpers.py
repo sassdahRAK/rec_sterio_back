@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import tempfile
 from functools import lru_cache
+from pathlib import Path
 from uuid import uuid4
 
 from app.auth import create_access_token, issue_folder_token, issue_guest_token
@@ -78,6 +79,38 @@ def media_bytes(suffix: str = ".mp4") -> bytes:
 
 # Kept for tests that assert on the raw payload.
 MEDIA_BYTES = media_bytes()
+
+
+@lru_cache(maxsize=1)
+def large_media_file(seconds: int = 40, video_kbps: int = 12_000):
+    """A genuinely large 720p testsrc2 mp4 (>50 MB), encoded once per process.
+
+    The delivery-compression tests need an original above the 50 MB delivery
+    threshold; a fixture that size is far too big to build per test, so it is
+    encoded to a fixed path in the temp dir keyed by its spec and reused while
+    the file is present. Returns None when ffmpeg is unavailable, and the
+    caller skips. Complex testsrc2 motion keeps the CRF ladders honest.
+    """
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return None
+    path = Path(tempfile.gettempdir()) / f"recsterio-large-fixture-{seconds}s-{video_kbps}k.mp4"
+    if not path.exists() or path.stat().st_size < 50 * 1024 * 1024:
+        proc = subprocess.run(
+            [
+                ffmpeg, "-nostdin", "-y", "-hide_banner", "-loglevel", "error",
+                "-f", "lavfi", "-i", f"testsrc2=size=1280x720:rate=30:duration={seconds}",
+                "-f", "lavfi", "-i", f"anullsrc=r=44100:cl=stereo:duration={seconds}",
+                "-c:v", "libx264", "-preset", "veryfast", "-b:v", f"{video_kbps}k",
+                "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart",
+                str(path),
+            ],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300, check=False,
+        )
+        if proc.returncode != 0 or path.stat().st_size < 50 * 1024 * 1024:
+            return None
+    return path
 
 
 def user_email(tag: str = "user") -> str:

@@ -6,6 +6,7 @@ create duplicate assets (files, transcript versions).
 from __future__ import annotations
 
 import logging
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
@@ -665,6 +666,194 @@ def handle_merge(db: Session, job: Job) -> None:
     db.flush()
 
 
+# Quality ladder for the delivery copy: (height, crf, typical Mbps at that
+# size). The first result at or under `settings.compress_target_mb` wins.
+# The estimate only decides when a source is too bitrate-starved for plain CRF
+# (see `compress_plan`).
+COMPRESS_TIERS: Sequence[tuple[int, int, float]] = (
+    (720, 23, 2.5),
+    (480, 25, 1.2),
+    (360, 28, 0.7),
+)
+
+# Audio copy in the compressed mp4 (+ container headroom) is paid off the top
+# of a capped budget; below the floor a rung cannot fit at all.
+_COMPRESS_AUDIO_KBPS = 128
+_COMPRESS_BITRATE_FLOOR_KBPS = 64
+
+
+def compress_plan(
+    source_size: int,
+    duration_seconds: Optional[float],
+    source_height: Optional[int],
+    *,
+    threshold_mb: int,
+) -> List[Dict[str, Any]]:
+    """Pure chooser for the delivery ladder.
+
+    Returns the rungs to encode in order: ``{"height", "crf", "maxrate_kbps"}``
+    per rung. ``height=None`` keeps the source resolution (the ladder only
+    scales down, never up); ``maxrate_kbps=None`` is plain CRF. An original at
+    or under the threshold yields ``[]`` (skip). A list that is empty for any
+    other reason has no feasible rung — every estimate was smaller than the
+    audio track alone — and the handler must fail with that reason.
+    """
+    if source_size <= threshold_mb * 1024 * 1024:
+        return []
+    rungs: List[Dict[str, Any]] = []
+    for height, crf, est_mbps in COMPRESS_TIERS:
+        spec: Dict[str, Any] = {
+            # Unknown source height is assumed worth scaling; a known one only
+            # when it is actually taller than the rung.
+            "height": height if (source_height is None or source_height > height) else None,
+            "crf": crf,
+            "maxrate_kbps": None,
+        }
+        if duration_seconds and duration_seconds > 0:
+            predicted = est_mbps * 1_000_000 / 8 * duration_seconds
+            if predicted > source_size:
+                # Rate-starved source (one long, small file): CRF alone could
+                # outgrow the original. Shrink the tier estimate
+                # proportionally down to the original's bitrate-equivalent,
+                # reserving room for the audio; never exceed the original.
+                budget_bps = source_size * 8 / duration_seconds
+                video_bps = budget_bps * 0.92 - _COMPRESS_AUDIO_KBPS * 1000
+                kbps = int(video_bps // 1000)
+                if kbps < _COMPRESS_BITRATE_FLOOR_KBPS:
+                    continue  # the audio track alone eats the budget
+                spec["maxrate_kbps"] = kbps
+        rungs.append(spec)
+    return rungs
+
+
+def _compress_note(db: Session, job: Job, note: Dict[str, Any]) -> None:
+    """Carry the compress outcome on the job row's payload (JSONB metadata)."""
+    job.payload = {**(job.payload or {}), "compress": note}
+    db.flush()
+
+
+def handle_compress_video(db: Session, job: Job) -> None:
+    """Produce the delivery-only compressed mp4 for sending to a chat.
+
+    Never touches the ASR inputs: `extract_audio`, `extract_mp3` and
+    `transcribe` keep reading `storage.find_media_file()` (the original). This
+    is a standalone job kind and never appears in a chain.
+
+    - Original at or under `compress_threshold_mb` -> succeed with a payload
+      note, no file (the bot sends the original itself).
+    - Existing compressed file -> idempotent success.
+    - Otherwise walk `compress_plan(...)` and keep the first rung at or under
+      `compress_target_mb`; a ladder that never fits is a permanent failure —
+      the bot then falls back to the portal link.
+    """
+    video = db.get(Video, job.video_id) if job.video_id else None
+    if video is None:
+        raise PermanentJobError("Video no longer exists.")
+    queue.ensure_not_cancelled(db, job)
+
+    media = storage.find_media_file(video.id)
+    if media is None:
+        raise PermanentJobError(
+            "No downloaded media found for this video; the download job must run first."
+        )
+
+    original_size = storage.file_size(media)
+    threshold_mb = settings.compress_threshold_mb
+    if original_size <= threshold_mb * 1024 * 1024:
+        note = (
+            f"skipped: original is {original_size} bytes, at or under the "
+            f"{threshold_mb} MB delivery threshold; the bot sends the original"
+        )
+        logger.info("compress skipped for %s: %s", video.id, note)
+        _compress_note(db, job, {"skipped_reason": note})
+        return
+
+    if storage.find_compressed_file(video.id) is not None:
+        # Idempotency: a re-run of the job must not re-encode (or duplicate).
+        existing = storage.compressed_media_file(video.id)
+        logger.info("compress skipped for %s: %s already exists", video.id, existing.name)
+        _compress_note(
+            db,
+            job,
+            {"size_bytes": storage.file_size(existing), "reused": True},
+        )
+        return
+
+    source_height, duration = asr_service.probe_media_video(media)
+    if duration is None:
+        duration = video.duration_seconds
+
+    plan = compress_plan(
+        original_size,
+        duration,
+        source_height,
+        threshold_mb=threshold_mb,
+    )
+    if not plan:
+        raise PermanentJobError(
+            "Compression has no feasible rung for this video: even the smallest "
+            "rung capped at the original's bitrate cannot fit the audio track."
+        )
+
+    target = settings.compress_target_mb * 1024 * 1024
+    dest = storage.compressed_media_file(video.id)
+    tmp_files: List[Path] = []
+    try:
+        for spec in plan:
+            queue.ensure_not_cancelled(db, job)
+            tmp_out = dest.with_name(
+                f"{dest.stem}-{spec['height'] or 'src'}p.mp4"
+            )
+            try:
+                asr_service.compress_video(
+                    media,
+                    tmp_out,
+                    height=spec["height"],
+                    crf=spec["crf"],
+                    maxrate_kbps=spec["maxrate_kbps"],
+                    timeout_seconds=settings.compression_timeout_seconds,
+                )
+            except RuntimeError as exc:
+                raise PermanentJobError(f"Video compression failed: {exc}") from exc
+            size = storage.file_size(tmp_out)
+            if 0 < size <= target:
+                for tmp in tmp_files:
+                    tmp.unlink(missing_ok=True)
+                shutil.move(str(tmp_out), dest)
+                logger.info(
+                    "compress finished for %s at %sp (crf %s): %s bytes",
+                    video.id,
+                    spec["height"],
+                    spec["crf"],
+                    size,
+                )
+                queue.ensure_not_cancelled(db, job)
+                _compress_note(
+                    db,
+                    job,
+                    {
+                        "size_bytes": storage.file_size(dest),
+                        "height": spec["height"],
+                        "crf": spec["crf"],
+                        "ladder_rung": spec.get("maxrate_kbps") is not None,
+                    },
+                )
+                return
+            tmp_files.append(tmp_out)
+    except BaseException:
+        for tmp in tmp_files:
+            tmp.unlink(missing_ok=True)
+        raise
+
+    for tmp in tmp_files:
+        tmp.unlink(missing_ok=True)
+    raise PermanentJobError(
+        f"Compression could not get this video under {settings.compress_target_mb} MB "
+        "(the delivery ladder is exhausted); the bot will fall back to the "
+        "portal link for downloads."
+    )
+
+
 # --------------------------------------------------------------------------
 # dispatcher
 # --------------------------------------------------------------------------
@@ -675,6 +864,7 @@ HANDLERS = {
     "transcribe": handle_transcribe,
     "gemini_transcribe": handle_gemini_transcribe,
     "merge": handle_merge,
+    "compress_video": handle_compress_video,
 }
 
 
@@ -703,7 +893,11 @@ def run_job(db: Session, job: Job) -> None:
         logger.warning("job %s (%s) failed permanently: %s", job.id, job.kind, exc)
         _fail_running_merge_rows(db, job, str(exc))
         queue.fail(db, job, str(exc), permanent=True)
-        _mark_video_failed(db, job, str(exc))
+        # A failed delivery compression says nothing against the pipeline
+        # outcome itself — a `transcribed` video keeps its transcript and its
+        # bot sends the portal link instead. Leave the video's status as-is.
+        if job.kind != "compress_video":
+            _mark_video_failed(db, job, str(exc))
         return
     except Exception as exc:  # noqa: BLE001
         logger.exception("job %s (%s) failed", job.id, job.kind)

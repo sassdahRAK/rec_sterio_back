@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 from app.access import (
     folder_or_404,
     require_media_editor,
+    require_operator,
     require_media_folder,
     require_read,
     require_video,
@@ -919,6 +920,89 @@ def retry_video(
     return JobOut.model_validate(job)
 
 
+def _active_compress_job(db: Session, video_id: UUID) -> Optional[Job]:
+    """The queued/running compress job for one video, if any."""
+    return (
+        db.execute(
+            select(Job)
+            .where(
+                Job.video_id == video_id,
+                Job.kind == "compress_video",
+                Job.status.in_(("queued", "running")),
+            )
+            .limit(1)
+        )
+        .scalars()
+        .first()
+    )
+
+
+def _enqueue_compress(db: Session, video: Video) -> Optional[Job]:
+    """Queue the delivery copy for one video, idempotently; None if refused.
+
+    One compress job per video at a time: a queued/running compress job wins
+    and nothing is enqueued again. A video whose ladder already ran to a
+    failure is terminal too — the bot's repeated media polls must not
+    re-encode the same impossible video forever; the operator re-runs it by
+    hand if they want another attempt.
+    """
+    active = _active_compress_job(db, video.id)
+    if active is not None:
+        return active
+    failed = db.execute(
+        select(Job.id)
+        .where(
+            Job.video_id == video.id,
+            Job.kind == "compress_video",
+            Job.status.in_(("failed", "dead")),
+        )
+        .limit(1)
+    ).scalar_one_or_none()
+    if failed is not None:
+        return None
+    job = queue.enqueue(db, "compress_video", video_id=video.id, priority=90)
+    db.commit()
+    db.refresh(job)
+    return job
+
+
+@router.post("/{video_id}/compress", response_model=JobOut, status_code=202)
+def compress_video_route(
+    video_id: UUID,
+    db: Session = Depends(get_db),
+    principal: Principal = Depends(get_principal),
+) -> JobOut:
+    """Queue the delivery-only compressed copy (`variant=compressed` media).
+
+    Operator work, run by hand from the console (or by the bot's service
+    identity): compression costs CPU. The job is standalone (no chain) and the
+    handler skips originals at or under `compress_threshold_mb`.
+    """
+    video = get_video_or_404(db, video_id)
+    require_operator(principal)
+
+    if storage.find_media_file(video.id) is None:
+        raise AppError(
+            409,
+            "not_ready",
+            "This video has no media on disk yet, so there is nothing to compress.",
+            [{"video_id": str(video.id), "status": video.status}],
+        )
+
+    # Idempotent enqueue: pressing again must not queue a second job.
+    active = _active_compress_job(db, video.id)
+    if active is not None:
+        return JobOut.model_validate(active)
+
+    # Delivery work sits behind ingestion/transcription in the queue. Unlike
+    # the media route, an operator pressing this again after a failure is an
+    # explicit request for another attempt, so past failures are re-run.
+    job = queue.enqueue(db, "compress_video", video_id=video.id, priority=90)
+    db.commit()
+    db.refresh(job)
+    return JobOut.model_validate(job)
+
+
 # ------------------------------------------------------------------ media
 
 
@@ -1027,23 +1111,20 @@ def _open_cloud_stream(
     )
 
 
-@router.get("/{video_id}/media")
-def stream_media(
-    video_id: UUID,
-    request: Request,
-    db: Session = Depends(get_db),
-    principal=Depends(get_optional_principal),
+def _serve_local_media(
+    path: Path,
+    mime: str,
+    range_header: Optional[str],
+    *,
+    compressed: bool,
 ) -> Response:
-    video = get_video_or_404(db, video_id)
-    _authorize_media(db, video, principal)
-    range_header = request.headers.get("range")
-    if video.storage_backend:
-        return _open_cloud_stream(db, video, range_header)
-    path = storage.find_media_file(video_id)
-    if path is None or not path.exists():
-        raise AppError(404, "not_found", "Media is not available yet for this video.")
+    """Serve one local media file (full or ranged), shared by both variants.
+
+    `X-Compressed` tells the caller which bytes it got: `true` only when this
+    response is the delivery-only copy, `false` for the original.
+    """
     size = path.stat().st_size
-    mime = video.mime_type or mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    marker = "true" if compressed else "false"
 
     if not range_header:
         return StreamingResponse(
@@ -1053,6 +1134,7 @@ def stream_media(
                 "Content-Length": str(size),
                 "Accept-Ranges": "bytes",
                 "Content-Disposition": f'inline; filename="{path.name}"',
+                "X-Compressed": marker,
             },
         )
 
@@ -1068,7 +1150,7 @@ def stream_media(
                     "details": [{"size": size, "range": range_header}],
                 }
             },
-            headers={"Content-Range": f"bytes */{size}"},
+            headers={"Content-Range": f"bytes */{size}", "X-Compressed": marker},
         )
 
     return StreamingResponse(
@@ -1080,8 +1162,85 @@ def stream_media(
             "Content-Range": f"bytes {start}-{end}/{size}",
             "Accept-Ranges": "bytes",
             "Content-Disposition": f'inline; filename="{path.name}"',
+            "X-Compressed": marker,
         },
     )
+
+
+@router.get("/{video_id}/media")
+def stream_media(
+    video_id: UUID,
+    request: Request,
+    variant: str = Query("original"),
+    db: Session = Depends(get_db),
+    principal=Depends(get_optional_principal),
+) -> Response:
+    """Stream a video's bytes; `variant=compressed` serves the delivery copy.
+
+    The compressed variant is delivery-only: ASR never reads it. It shares the
+    original's authorization (`_authorize_media` runs before anything else) and
+    its streaming/range machinery. When no compressed copy exists the route
+    answers the one not-ready code the bot knows (`compressed_not_ready`) and —
+    for an original above the delivery threshold — queues the compress job so a
+    retry a little later can succeed. The original is never served in place of
+    the copy: the bot would be handed >50 MB bytes it cannot send.
+    """
+    video = get_video_or_404(db, video_id)
+    # Auth first: the compressed variant must be exactly as private/public as
+    # the original, and a caller must not learn "variant invalid" before that.
+    _authorize_media(db, video, principal)
+    if variant not in ("original", "compressed"):
+        raise AppError(
+            422,
+            "validation_failed",
+            "variant must be 'original' or 'compressed'.",
+            [{"field": "variant", "issue": "unsupported_value", "variant": variant}],
+        )
+    range_header = request.headers.get("range")
+    if video.storage_backend:
+        # Out of scope: no compressed copy is made of a cloud-backed video.
+        if variant == "compressed":
+            raise AppError(
+                404,
+                "compressed_not_ready",
+                "No compressed delivery copy is produced for a cloud-stored video.",
+            )
+        response = _open_cloud_stream(db, video, range_header)
+        response.headers["X-Compressed"] = "false"
+        return response
+
+    if variant == "compressed":
+        path = storage.find_compressed_file(video_id)
+        if path is not None:
+            return _serve_local_media(
+                path, "video/mp4", range_header, compressed=True
+            )
+        # No copy yet: every absent case is the same 404 code; an original big
+        # enough to need delivery compression gets its job queued right here.
+        original_path = storage.find_media_file(video_id)
+        big_enough = (
+            original_path is not None
+            and original_path.exists()
+            and storage.file_size(original_path)
+            > settings.compress_threshold_mb * 1024 * 1024
+        )
+        queued = _enqueue_compress(db, video) if big_enough else None
+        if queued is not None:
+            detail = "The compressed copy is being prepared; ask again shortly."
+        elif big_enough:
+            detail = (
+                "Compression already failed for this video; the operator can "
+                "run POST /compress to try again."
+            )
+        else:
+            detail = "No compressed delivery copy exists for this video."
+        raise AppError(404, "compressed_not_ready", detail)
+
+    path = storage.find_media_file(video_id)
+    if path is None or not path.exists():
+        raise AppError(404, "not_found", "Media is not available yet for this video.")
+    mime = video.mime_type or mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    return _serve_local_media(path, mime, range_header, compressed=False)
 
 
 @router.get("/{video_id}/audio")
