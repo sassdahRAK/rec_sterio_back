@@ -2,6 +2,29 @@
 
 The rules, in one place so no route drifts:
 
+Capability matrix (``docs/API_CONTRACT.md`` §0)::
+
+    | capability                        | super_admin | admin | developer | reviewer | user            |
+    |-----------------------------------|-------------|-------|-----------|----------|-----------------|
+    | jobs: view + retry, stats         | yes         | yes   | yes       | -        | -               |
+    | library: view + act on visible    | yes         | yes   | yes       | yes      | scoped          |
+    | videos: retry/delete/move/fork    | yes         | yes   | yes       | -        | -               |
+    | transcripts: edit/clean any       | yes         | yes   | -         | yes      | editor-by-folder|
+    | folders: create/publish/share/zip | yes         | yes   | -         | -        | by folder role  |
+
+**A library tier is a capability, never a folder rank.** Do not seed
+``developer``/``reviewer`` into :func:`role_on_folder` or
+:func:`visible_folders` (the regression in commit 03639b5): a single rank
+cannot express the matrix — ``editor`` would hand the developer folder
+administration *and* transcript editing, both of which the matrix denies — and
+it would make an ungranted private folder visible. The tier's widening lives in
+the capability predicates below (:func:`can_act_on_video`,
+:func:`can_edit_transcript`, :func:`can_administer_folder`); the media and
+folder predicates apply only to a folder the account can already see, while
+:func:`can_edit_transcript` grants its tier whatever folder the video lives in.
+An ungranted private folder resolves to ``None`` for every non-admin account:
+404 on read, absent from listings.
+
 * an **admin** (the bootstrap operator) may read and manage every folder;
 * the **library tier** (`developer`, `reviewer`) is **not** granted folder
   visibility: a private folder with no grant on it stays invisible to them
@@ -191,6 +214,80 @@ def video_role(
     return role_on_folder(db, folder, principal, user=user)
 
 
+# ---------------------------------------------------- capability predicates
+#
+# One predicate per matrix row the library tier widens. They are the single
+# source the guards below delegate to; do not reintroduce a per-folder "floor"
+# for developer/reviewer (commit 03639b5) — one rank cannot express "delete the
+# video, but not administer the folder, but not edit the transcript".
+
+_EDITOR_RANK = ROLE_RANK["editor"]
+
+
+def _resolve_folder(db: Session, folder: Optional[Folder | UUID]) -> Optional[Folder]:
+    if folder is None or isinstance(folder, Folder):
+        return folder
+    return db.get(Folder, folder)
+
+
+def can_act_on_video(
+    db: Session, folder: Optional[Folder | UUID], principal: Principal
+) -> bool:
+    """retry/delete/move/fork of media: admin tier, developer, or editor rank.
+
+    The developer grant (``LIBRARY_MEDIA_ROLES``) is library-scoped: it needs a
+    folder the account can already see (``role_on_folder`` is not None), so an
+    ungranted private folder grants nothing and an invisible unit is a 403.
+    """
+    folder = _resolve_folder(db, folder)
+    if folder is None:
+        return False
+    role = role_on_folder(db, folder, principal)
+    if role is None:
+        return False
+    return principal.role in LIBRARY_MEDIA_ROLES or ROLE_RANK.get(
+        role, 0
+    ) >= _EDITOR_RANK
+
+
+def can_edit_transcript(
+    db: Session, folder: Optional[Folder | UUID], principal: Principal
+) -> bool:
+    """edit/clean a transcript: admin tier, reviewer, or editor rank.
+
+    The reviewer's row is ``edit/clean any``, so it is deliberately *not*
+    conditioned on folder visibility — the transcript capability is orthogonal
+    to the folder. The developer is excluded (``TRANSCRIPT_EDIT_ROLES`` does
+    not hold them); only a genuine ``editor`` grant on the folder reaches this
+    row for a non-tier account.
+    """
+    if principal.role in TRANSCRIPT_EDIT_ROLES:  # admin tier + reviewer
+        return True
+    folder = _resolve_folder(db, folder)
+    if folder is None:
+        return False
+    role = role_on_folder(db, folder, principal)
+    return role is not None and ROLE_RANK.get(role, 0) >= _EDITOR_RANK
+
+
+def can_administer_folder(
+    db: Session, folder: Optional[Folder | UUID], principal: Principal
+) -> bool:
+    """create/rename/delete/publish/share/zip/members: admin tier or editor.
+
+    Neither library tier qualifies by role. A developer or reviewer reaches this
+    row only through a genuine ``editor`` grant (owner or membership), the "by
+    folder role" column of the matrix.
+    """
+    if principal.role in ADMIN_TIER:
+        return True
+    folder = _resolve_folder(db, folder)
+    if folder is None:
+        return False
+    role = role_on_folder(db, folder, principal)
+    return role is not None and ROLE_RANK.get(role, 0) >= _EDITOR_RANK
+
+
 # ------------------------------------------------------------------ guards
 
 
@@ -199,8 +296,7 @@ def can_read_folder(db: Session, folder: Folder, principal: Principal) -> bool:
 
 
 def can_manage_folder(db: Session, folder: Folder, principal: Principal) -> bool:
-    role = role_on_folder(db, folder, principal)
-    return role is not None and ROLE_RANK.get(role, 0) >= ROLE_RANK["editor"]
+    return can_administer_folder(db, folder, principal)
 
 
 def require_read(db: Session, folder: Folder, principal: Principal) -> str:
@@ -219,7 +315,7 @@ def require_read(db: Session, folder: Folder, principal: Principal) -> str:
 
 def require_manage(db: Session, folder: Folder, principal: Principal) -> str:
     role = role_on_folder(db, folder, principal)
-    if role is None or ROLE_RANK.get(role, 0) < ROLE_RANK["editor"]:
+    if not can_administer_folder(db, folder, principal):
         raise AppError(
             403,
             "forbidden",
@@ -301,10 +397,12 @@ def require_media_editor(db: Session, video: Video, principal: Principal) -> str
     that made it visible — public, a viewer membership, ownership. This is the
     plan's "developer acts on any unit they can see" and it stops exactly
     there: an invisible unit still fails `require_video`'s 403, and folder
-    administration keeps going through `require_manage`.
+    administration keeps going through `require_manage`. Delegates to
+    :func:`can_act_on_video` so the matrix lives in one place.
     """
+    folder = db.get(Folder, video.folder_id) if video.folder_id else None
     role = video_role(db, video, principal)
-    if role is not None and principal.role in LIBRARY_MEDIA_ROLES:
+    if role is not None and can_act_on_video(db, folder, principal):
         return role
     return require_video(db, video, principal, need="editor")
 
@@ -316,10 +414,11 @@ def require_media_folder(db: Session, folder: Folder, principal: Principal) -> s
     same reason as `require_media_editor`, with the same library-tier widening:
     a `LIBRARY_MEDIA_ROLES` member whose destination is already visible may
     file media there. An invisible destination stays a 403, so a developer
-    cannot push a unit into a private folder they hold no role on.
+    cannot push a unit into a private folder they hold no role on. Delegates to
+    :func:`can_act_on_video`.
     """
     role = role_on_folder(db, folder, principal)
-    if role is not None and principal.role in LIBRARY_MEDIA_ROLES:
+    if role is not None and can_act_on_video(db, folder, principal):
         return role
     return require_manage(db, folder, principal)
 
@@ -335,8 +434,10 @@ def require_transcript_editor(
     per-folder role says nothing useful about who should fix a wrong word.
     Everything heavier (moving or deleting the media, ingesting into a
     folder) keeps the plain editor requirement, so this widening stops at
-    the transcript text.
+    the transcript text. Delegates to :func:`can_edit_transcript`, which also
+    admits an editor-by-folder account and excludes the developer.
     """
-    if principal.role in TRANSCRIPT_EDIT_ROLES:
+    folder = db.get(Folder, video.folder_id) if video.folder_id else None
+    if can_edit_transcript(db, folder, principal):
         return "editor"
     return require_video(db, video, principal, need="editor")
