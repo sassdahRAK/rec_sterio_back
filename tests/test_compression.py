@@ -269,6 +269,39 @@ def test_compress_fails_when_the_ladder_never_fits(monkeypatch):
     assert not storage.compressed_media_file(video_id).exists()
     assert [p for p in (storage.video_dir(video_id)).iterdir() if p.name.startswith("compressed-")] == []
     assert "delivery ladder is exhausted" in (job.last_error or "")
+    # Only the job failed: the video keeps its own pipeline status.
+    with SessionLocal() as db:
+        assert db.get(Video, video_id).status == "downloaded"
+
+
+def test_ladder_exhaust_keeps_a_transcribed_video_transcribed(monkeypatch):
+    """A compress permanent-failure must not overwrite a healthy outcome.
+
+    The delivery ladder exhausting says nothing against the video's pipeline
+    result — a `transcribed` video keeps its transcript and the bot falls back
+    to the portal link — so the video's status (and error) is left as-is while
+    the job row itself goes failed.
+    """
+    video_id = _video_with_media()
+    with SessionLocal() as db:
+        db.get(Video, video_id).status = "transcribed"
+        db.commit()
+    monkeypatch.setattr(settings, "compress_threshold_mb", 0)
+    monkeypatch.setattr(settings, "compress_target_mb", 0)
+    sizes = {(720, 23): 3000, (480, 25): 2000, (360, 28): 1000}
+    calls: list[dict] = []
+    monkeypatch.setattr(
+        asr_service, "compress_video", _recording_compress(sizes, calls)
+    )
+
+    job = _run_compress_job(video_id)
+
+    assert job.status == "failed", job.last_error
+    assert [(c["height"], c["crf"]) for c in calls] == [(720, 23), (480, 25), (360, 28)]
+    with SessionLocal() as db:
+        video = db.get(Video, video_id)
+        assert video.status == "transcribed"
+        assert video.error is None
 
 
 def test_compress_passes_the_delivery_timeout(monkeypatch):
