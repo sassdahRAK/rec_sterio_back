@@ -21,8 +21,9 @@ from app.access import (
     ROLE_RANK,
     folder_or_404,
     require_manage,
+    require_media_editor,
+    require_media_folder,
     require_read,
-    require_video,
     user_for,
     video_role,
     visible_folders,
@@ -359,13 +360,13 @@ def place_video(
     # video from a folder they cannot see (or pull one out of a private folder
     # into one they manage).
     if video.folder_id is not None:
-        require_video(db, video, principal, need="editor")
+        require_media_editor(db, video, principal)
 
     if payload.folder_id is None:
         video.folder_id = None
     else:
         folder = folder_or_404(db, payload.folder_id)
-        require_manage(db, folder, principal)
+        require_media_folder(db, folder, principal)
         video.folder_id = folder.id
     if payload.position is not None:
         video.position = payload.position
@@ -720,11 +721,36 @@ def download_folder_zip(
         zip_export.build_folder_zip(db, folder, dest)
     except ValueError as exc:
         dest.unlink(missing_ok=True)
+        # `zip_export` uses ValueError for two unrelated answers: an empty tree
+        # ("no downloadable media") and a tree past the guard rails (5000
+        # entries / 2 GiB, API_CONTRACT §3). They must not share an error code:
+        # a limit hit is a size problem the caller can act on by exporting a
+        # sub-folder, not "there is nothing here".
+        reason = str(exc)
+        lowered = reason.lower()
+        if "entry limit" in lowered or "size limit" in lowered:
+            if "entry limit" in lowered:
+                limit = f"{zip_export.MAX_ENTRIES} entries"
+            else:
+                total = zip_export.MAX_TOTAL_BYTES
+                if total >= 1024 ** 3:
+                    limit = f"{total / (1024 ** 3):g} GiB"
+                elif total >= 1024 ** 2:
+                    limit = f"{total / (1024 ** 2):g} MiB"
+                else:
+                    limit = f"{total} byte" if total == 1 else f"{total} bytes"
+            raise AppError(
+                409,
+                "zip_too_large",
+                f"This folder is too large to export as one archive: the limit "
+                f"is {limit}. Export a sub-folder or split the dataset.",
+                [{"folder_id": str(folder.id), "reason": reason, "limit": limit}],
+            ) from exc
         raise AppError(
             409,
             "nothing_to_export",
             "This folder has no downloadable media yet.",
-            [{"folder_id": str(folder.id), "reason": str(exc)}],
+            [{"folder_id": str(folder.id), "reason": reason}],
         ) from exc
 
     def _cleanup(path: Path = dest) -> None:
