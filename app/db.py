@@ -1,10 +1,12 @@
 """SQLAlchemy engine/session plumbing."""
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Iterator
 
-from sqlalchemy import create_engine
-from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
+from sqlalchemy import DateTime, Integer, create_engine, func
+from sqlalchemy.engine import Connection
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 from app.config import settings
 
@@ -23,6 +25,39 @@ class Base(DeclarativeBase):
     pass
 
 
+class SchemaMigration(Base):
+    """One row per applied schema version (the migration version stamp).
+
+    The hand-rolled upgrade batch below is far too heavy to re-run on every
+    container start: it takes table locks, runs DDL/DML, and two containers
+    booting together would fight over it. This table records the version the
+    database has already reached, so the batch runs exactly once per database
+    and a concurrent boot waits on an advisory lock instead of racing.
+
+    Declared on `Base` (not in `models.py`) on purpose: `create_all` creates it
+    on a fresh database, and a test that drops/recreates the schema drops the
+    stamp with it — a stale stamp must never outlive the schema it describes.
+    """
+
+    __tablename__ = "schema_migrations"
+
+    version: Mapped[int] = mapped_column(Integer, primary_key=True)
+    applied_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+# Bump this whenever `_ADDED_COLUMNS` or `_ADDED_FOREIGN_KEYS` gains a step.
+# A database already stamped at this version skips the whole batch.
+SCHEMA_VERSION = 1
+
+# Advisory-lock key for the migration. Follows the codebase's
+# `hashtextextended(<key>, 0)` pattern (see `app/routers/videos.py`); the xact
+# form releases itself when the transaction ends, so a crashed boot cannot
+# leave the lock held.
+_MIGRATION_LOCK_KEY = "recsterio.schema_migrations"
+
+
 def get_db() -> Iterator[Session]:
     db = SessionLocal()
     try:
@@ -36,12 +71,78 @@ def get_db() -> Iterator[Session]:
 
 
 def init_db() -> None:
-    """Create tables if they do not exist (bootstrap; alembic optional later)."""
+    """Create tables if they do not exist (bootstrap; alembic optional later).
+
+    `create_all` is cheap and idempotent, so it still runs on every boot: a new
+    table (or the stamp table itself) is created even when the version is
+    already current. Only the expensive ALTER/UPDATE/DML batch is gated by
+    `SCHEMA_VERSION`.
+    """
     from app import models  # noqa: F401  (register mappers)
 
-    Base.metadata.create_all(bind=engine)
-    _add_missing_columns()
-    _add_missing_constraints()
+    if engine.dialect.name != "postgresql":
+        Base.metadata.create_all(bind=engine)
+        return
+
+    # One transaction: lock, create tables, read the stamp, migrate, stamp.
+    # A second container booting at the same time blocks on the advisory lock
+    # and then sees the bumped version, so the batch never runs twice.
+    with engine.begin() as conn:
+        conn.exec_driver_sql(
+            "select pg_advisory_xact_lock(hashtextextended(%s, 0))",
+            (_MIGRATION_LOCK_KEY,),
+        )
+        Base.metadata.create_all(bind=conn)
+
+        current = _current_schema_version(conn)
+        if current >= SCHEMA_VERSION:
+            return
+        if current == 0 and _migration_already_applied(conn):
+            # A database from before the stamp existed: the batch has already
+            # been applied by the previous code, so adopt it without replaying
+            # any destructive work — just record where it stands.
+            _record_schema_version(conn, SCHEMA_VERSION)
+            return
+
+        _run_migration_statements(conn)
+        _record_schema_version(conn, SCHEMA_VERSION)
+
+
+def _current_schema_version(conn: Connection) -> int:
+    return conn.exec_driver_sql(
+        "select coalesce(max(version), 0) from schema_migrations"
+    ).scalar_one()
+
+
+def _record_schema_version(conn: Connection, version: int) -> None:
+    conn.exec_driver_sql(
+        "insert into schema_migrations (version) values (%s)"
+        " on conflict (version) do nothing",
+        (version,),
+    )
+
+
+# Proof that the whole batch has run at least once on this database. The
+# composite unique index is the last statement in `_ADDED_COLUMNS` and is the
+# only guard rail `create_all` can never produce (the model does not declare
+# it), so its presence means "already migrated" even when the stamp is empty.
+_MIGRATION_MARKER_INDEX = "ix_drive_links_user_provider"
+
+
+def _migration_already_applied(conn: Connection) -> bool:
+    row = conn.exec_driver_sql(
+        "select 1 from pg_indexes"
+        " where schemaname = current_schema() and indexname = %s",
+        (_MIGRATION_MARKER_INDEX,),
+    ).fetchone()
+    return row is not None
+
+
+def _run_migration_statements(conn: Connection) -> None:
+    """The whole upgrade batch, in order, inside the caller's transaction."""
+    for statement in _ADDED_COLUMNS:
+        conn.exec_driver_sql(statement)
+    _apply_missing_constraints(conn)
 
 
 # Columns added after the first release. `create_all` never alters an existing
@@ -128,6 +229,8 @@ _ADDED_COLUMNS = (
 
 
 def _add_missing_columns() -> None:
+    """Standalone entry point (manual repairs); the boot path runs the same
+    statements, plus the constraints, inside the gated migration transaction."""
     if engine.dialect.name != "postgresql":
         return
     with engine.begin() as conn:
@@ -153,37 +256,43 @@ _ADDED_FOREIGN_KEYS = (
 
 
 def _add_missing_constraints() -> None:
+    """Standalone entry point (tests and manual repairs); the boot path runs
+    `_apply_missing_constraints` inside the gated migration transaction."""
     if engine.dialect.name != "postgresql":
         return
     with engine.begin() as conn:
-        for table, name, column, parent, parent_column, on_delete in _ADDED_FOREIGN_KEYS:
-            # Orphaned rows would make ADD CONSTRAINT fail, so repair them first.
-            if parent == table:
-                # Self-reference (videos.copied_from_id -> videos.id): the
-                # subquery's range var shadows the outer one, so the unaliased
-                # form below would compare the inner row to itself and null out
-                # every value. Alias both sides explicitly.
-                conn.exec_driver_sql(
-                    f"update {table} as t set {column} = null"
-                    f" where t.{column} is not null"
-                    f" and not exists (select 1 from {parent} as p"
-                    f" where p.{parent_column} = t.{column})"
-                )
-            else:
-                conn.exec_driver_sql(
-                    f"update {table} set {column} = null"
-                    f" where {column} is not null"
-                    f" and not exists (select 1 from {parent}"
-                    f" where {parent}.{parent_column} = {table}.{column})"
-                )
-            exists = conn.exec_driver_sql(
-                "select 1 from pg_constraint c"
-                " where c.conname = %s and c.conrelid = %s::regclass",
-                (name, table),
-            ).fetchone()
-            if exists is None:
-                conn.exec_driver_sql(
-                    f"alter table {table} add constraint {name}"
-                    f" foreign key ({column}) references {parent}({parent_column})"
-                    f" on delete {on_delete}"
-                )
+        _apply_missing_constraints(conn)
+
+
+def _apply_missing_constraints(conn: Connection) -> None:
+    for table, name, column, parent, parent_column, on_delete in _ADDED_FOREIGN_KEYS:
+        # Orphaned rows would make ADD CONSTRAINT fail, so repair them first.
+        if parent == table:
+            # Self-reference (videos.copied_from_id -> videos.id): the
+            # subquery's range var shadows the outer one, so the unaliased
+            # form below would compare the inner row to itself and null out
+            # every value. Alias both sides explicitly.
+            conn.exec_driver_sql(
+                f"update {table} as t set {column} = null"
+                f" where t.{column} is not null"
+                f" and not exists (select 1 from {parent} as p"
+                f" where p.{parent_column} = t.{column})"
+            )
+        else:
+            conn.exec_driver_sql(
+                f"update {table} set {column} = null"
+                f" where {column} is not null"
+                f" and not exists (select 1 from {parent}"
+                f" where {parent}.{parent_column} = {table}.{column})"
+            )
+        exists = conn.exec_driver_sql(
+            "select 1 from pg_constraint c"
+            " where c.conname = %s and c.conrelid = %s::regclass",
+            (name, table),
+        ).fetchone()
+        if exists is None:
+            conn.exec_driver_sql(
+                f"alter table {table} add constraint {name}"
+                f" foreign key ({column}) references {parent}({parent_column})"
+                f" on delete {on_delete}"
+            )
