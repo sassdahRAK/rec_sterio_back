@@ -47,11 +47,19 @@ def ensure_not_cancelled(db: Session, job: Job) -> None:
     Reads the job row straight from the database (a column query bypasses the
     session identity map) so a cancel committed by another session is visible
     even though this handler's in-memory ``job`` still says ``running``.
+
+    A legacy ``status = 'cancelled'`` row (a value no committed code writes; the
+    boot batch rewrites it into the canonical pair) counts as cancelled too, so
+    a handler still unwinding cannot write past it before that migration runs.
     """
     row = db.execute(
         select(Job.status, Job.last_error).where(Job.id == job.id)
     ).one_or_none()
-    if row is not None and row[0] == "failed" and row[1] == CANCELLED_MARKER:
+    if row is None:
+        return
+    legacy_cancelled = row[0] == "cancelled"
+    canonical_cancelled = row[0] == "failed" and row[1] == CANCELLED_MARKER
+    if legacy_cancelled or canonical_cancelled:
         raise JobCancelled(f"job {job.id} was cancelled")
 
 

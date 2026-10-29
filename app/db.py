@@ -49,7 +49,7 @@ class SchemaMigration(Base):
 
 # Bump this whenever `_ADDED_COLUMNS` or `_ADDED_FOREIGN_KEYS` gains a step.
 # A database already stamped at this version skips the whole batch.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # Advisory-lock key for the migration. Follows the codebase's
 # `hashtextextended(<key>, 0)` pattern (see `app/routers/videos.py`); the xact
@@ -222,6 +222,16 @@ _ADDED_COLUMNS = (
     "alter table videos add column if not exists drive_file_id varchar(255)",
     "alter table videos add column if not exists drive_link_id uuid",
     "create index if not exists ix_videos_drive_link_id on videos (drive_link_id)",
+    # Job cancellation is `failed` + `last_error = 'cancelled'` (see
+    # `app/worker/queue.py`). No committed code writes a `status = 'cancelled'`
+    # row, but one predates that convention and survives in a dev database:
+    # left alone it would be retryable and a late handler write could still
+    # move it. Rewrite it into the canonical terminal pair; `coalesce(nullif)`
+    # keeps a real error message that happened to sit on a legacy row instead
+    # of flattening it to the marker.
+    "update jobs set status = 'failed',"
+    " last_error = coalesce(nullif(last_error, ''), 'cancelled')"
+    " where status = 'cancelled'",
     # One live drive link per (account, provider): enforced at the DB level so
     # two concurrent connect requests cannot create duplicate rows.
     "create unique index if not exists ix_drive_links_user_provider on drive_links (user_id, provider)",

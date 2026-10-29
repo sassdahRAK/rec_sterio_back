@@ -15,7 +15,11 @@ from __future__ import annotations
 import wave
 from uuid import uuid4
 
-from app.db import SessionLocal
+import pytest
+from sqlalchemy import text
+
+from app import db as db_module
+from app.db import SessionLocal, engine, init_db
 from app.models import Job, Merge, Transcript, Video
 from app.services import asr as asr_service
 from app.services import storage
@@ -248,3 +252,96 @@ def test_retry_of_a_cancelled_job_is_refused(client, auth_headers):
         job = db.get(Job, job_id)
         assert job.status == "failed"
         assert job.last_error == "cancelled"
+
+
+def _legacy_cancelled_job(kind: str = "fake", video_id=None) -> str:
+    """A pre-convention row: `status='cancelled'` with no marker.
+
+    No committed code writes this value; it predates the `failed` + marker
+    convention and is what the version-2 boot batch rewrites.
+    """
+    with SessionLocal() as db:
+        job = queue.enqueue(db, kind, video_id=video_id, payload={})
+        job.status = "cancelled"
+        job.last_error = None
+        job.attempts = 1
+        job.started_at = queue.utcnow()
+        db.commit()
+        return str(job.id)
+
+
+def test_retry_of_a_legacy_cancelled_row_is_refused(client, auth_headers):
+    """`status='cancelled'` predates the marker, but is still terminal."""
+    with SessionLocal() as db:
+        video = Video(
+            source_url="https://example.org/cancel-legacy-retry-001", platform="direct"
+        )
+        db.add(video)
+        db.flush()
+        job = queue.enqueue(db, "download", video_id=video.id, payload={})
+        job.status = "cancelled"
+        job.last_error = None
+        job.attempts = 1
+        job.started_at = queue.utcnow()
+        db.commit()
+        job_id = str(job.id)
+
+    resp = client.post(f"/api/v1/jobs/{job_id}/retry", headers=auth_headers)
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["error"]["code"] == "conflict"
+
+    with SessionLocal() as db:
+        job = db.get(Job, job_id)
+        assert job.status == "cancelled", "a refused retry must leave the job untouched"
+        assert job.last_error is None
+        assert job.attempts == 1
+
+
+def test_ensure_not_cancelled_recognises_a_legacy_cancelled_row():
+    job_id = _legacy_cancelled_job()
+    with SessionLocal() as db:
+        with pytest.raises(queue.JobCancelled):
+            queue.ensure_not_cancelled(db, db.get(Job, job_id))
+
+
+def test_succeed_does_not_overwrite_a_legacy_cancelled_row():
+    """The late-write hole is closed before the boot batch ever runs."""
+    job_id = _legacy_cancelled_job()
+    with SessionLocal() as db:
+        queue.succeed(db, db.get(Job, job_id))
+    with SessionLocal() as db:
+        job = db.get(Job, job_id)
+        assert job.status == "cancelled", "succeed() must not move a cancelled row"
+        assert job.last_error is None
+
+
+def test_migration_normalises_legacy_cancelled_rows(client, monkeypatch):
+    """The version-2 boot batch rewrites the legacy status into the marker pair.
+
+    Exercises the batch the way `tests/test_boot_idempotent.py` does: force the
+    "database is genuinely below target" path so `init_db` cannot take the
+    adoption shortcut, then let it run.
+    """
+    with SessionLocal() as db:
+        null_error = queue.enqueue(db, "fake")
+        null_error.status = "cancelled"
+        null_error.last_error = None
+        kept_error = queue.enqueue(db, "fake")
+        kept_error.status = "cancelled"
+        kept_error.last_error = "engine exploded"
+        db.commit()
+        null_id, kept_id = str(null_error.id), str(kept_error.id)
+
+    monkeypatch.setattr(db_module, "_migration_already_applied", lambda conn: False)
+    with engine.begin() as conn:
+        conn.execute(text("delete from schema_migrations"))
+    init_db()
+
+    with SessionLocal() as db:
+        normalised = db.get(Job, null_id)
+        assert normalised.status == "failed"
+        assert normalised.last_error == "cancelled"
+        kept = db.get(Job, kept_id)
+        assert kept.status == "failed"
+        assert kept.last_error == "engine exploded", "a recorded error must survive"
+        assert db_module.SCHEMA_VERSION == 2

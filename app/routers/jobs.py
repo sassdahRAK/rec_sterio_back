@@ -103,7 +103,9 @@ def retry_job(
     # A cancellation is terminal (queue.CANCELLED_MARKER): the handler may still
     # be unwinding, and requeueing the row would let its late succeed() win over
     # the fresh run. Start a new pass instead (video retry / generate).
-    if job.last_error == queue.CANCELLED_MARKER:
+    # A legacy `status = "cancelled"` row (the boot batch normalises it) is the
+    # same terminal cancellation and must not be requeued either.
+    if job.status == "cancelled" or job.last_error == queue.CANCELLED_MARKER:
         raise AppError(
             409,
             "conflict",
