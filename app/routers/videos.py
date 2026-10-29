@@ -16,7 +16,8 @@ from sqlalchemy.orm import Session
 
 from app.access import (
     folder_or_404,
-    require_manage,
+    require_media_editor,
+    require_media_folder,
     require_read,
     require_video,
     video_role,
@@ -285,7 +286,7 @@ def create_video(
         if folder is None:
             raise AppError(404, "not_found", "Folder not found.", [{"id": str(payload.folder_id)}])
         # Ingesting *into* a folder is an edit of that dataset.
-        require_manage(db, folder, principal)
+        require_media_folder(db, folder, principal)
 
     # Idempotency: the same URL (that is not failed) must not be duplicated.
     # Only against what the caller can already read — see `_dedupe_scope`.
@@ -550,7 +551,7 @@ async def upload_video(
         folder = db.get(Folder, folder_id)
         if folder is None:
             raise AppError(404, "not_found", "Folder not found.", [{"id": str(folder_id)}])
-        require_manage(db, folder, principal)
+        require_media_folder(db, folder, principal)
 
     video = Video(
         source_url=f"upload://{Path(file.filename or 'upload').name}",
@@ -735,14 +736,14 @@ def update_video(
     principal: Principal = Depends(get_principal),
 ) -> VideoOut:
     video = get_video_or_404(db, video_id)
-    require_video(db, video, principal, need="editor")
+    require_media_editor(db, video, principal)
     data = payload.model_dump(exclude_unset=True)
     # `folder_id` is a move, not a field edit: entering a folder is a write on
     # that folder. The guard above covers the folder being left; without this an
     # editor of folder A could drop a video into a private folder B they cannot
     # see, which is the same hole as `PUT /videos/{id}/folder`.
     if data.get("folder_id") is not None:
-        require_manage(db, folder_or_404(db, data["folder_id"]), principal)
+        require_media_folder(db, folder_or_404(db, data["folder_id"]), principal)
     for field, value in data.items():
         setattr(video, field, value)
     db.commit()
@@ -757,7 +758,7 @@ def delete_video(
     principal: Principal = Depends(get_principal),
 ) -> Response:
     video = get_video_or_404(db, video_id)
-    require_video(db, video, principal, need="editor")
+    require_media_editor(db, video, principal)
     db.execute(Transcript.__table__.delete().where(Transcript.video_id == video_id))
     db.execute(Merge.__table__.delete().where(Merge.video_id == video_id))
     db.execute(Job.__table__.delete().where(Job.video_id == video_id))
@@ -793,7 +794,7 @@ def copy_video(
     require_video(db, source, principal, need="viewer")
 
     folder = folder_or_404(db, payload.folder_id)
-    require_manage(db, folder, principal)
+    require_media_folder(db, folder, principal)
     if source.folder_id == folder.id:
         raise AppError(
             422,
@@ -880,7 +881,7 @@ def retry_video(
     principal: Principal = Depends(get_principal),
 ) -> JobOut:
     video = get_video_or_404(db, video_id)
-    require_video(db, video, principal, need="editor")
+    require_media_editor(db, video, principal)
 
     # A double-tapped Retry must not queue a second download of the same file:
     # two jobs would race over one output path and download the media twice.

@@ -45,3 +45,8 @@ LIBRARY_VIEW_ROLES = (ROLE_SUPER_ADMIN, ROLE_ADMIN, ROLE_DEVELOPER, ROLE_REVIEWE
 # transcripts; it does NOT extend to moving or deleting the media, which keep
 # the per-folder "editor" requirement.
 TRANSCRIPT_EDIT_ROLES = (ROLE_SUPER_ADMIN, ROLE_ADMIN, ROLE_REVIEWER)
+
+# Media actions (delete/move/retry/ingest) on a unit the caller can already
+# read. Deliberately narrower than ADMIN_TIER: no folder administration, no
+# transcript editing. See require_media_editor in access.py.
+LIBRARY_MEDIA_ROLES = (ROLE_SUPER_ADMIN, ROLE_ADMIN, ROLE_DEVELOPER)

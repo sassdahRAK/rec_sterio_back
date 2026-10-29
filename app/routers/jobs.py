@@ -100,6 +100,37 @@ def retry_job(
             "Only failed or dead jobs can be retried.",
             [{"status": job.status}],
         )
+    # A cancellation is terminal (queue.CANCELLED_MARKER): the handler may still
+    # be unwinding, and requeueing the row would let its late succeed() win over
+    # the fresh run. Start a new pass instead (video retry / generate).
+    if job.last_error == queue.CANCELLED_MARKER:
+        raise AppError(
+            409,
+            "conflict",
+            "This job was cancelled, which is terminal; start a new pass instead of retrying it.",
+            [{"job_id": str(job.id), "status": job.status, "reason": queue.CANCELLED_MARKER}],
+        )
+    # Never race a handler that is already running the same step for the same
+    # video: the stale run's succeed() could otherwise overwrite the retry.
+    if job.video_id is not None:
+        running = db.execute(
+            select(Job.id)
+            .where(
+                Job.video_id == job.video_id,
+                Job.kind == job.kind,
+                Job.status == "running",
+                Job.id != job.id,
+            )
+            .limit(1)
+        ).first()
+        if running is not None:
+            raise AppError(
+                409,
+                "conflict",
+                f"A {job.kind} job for this video is still running; "
+                "retrying now would race it.",
+                [{"job_id": str(running[0]), "kind": job.kind, "status": "running"}],
+            )
     queue.requeue(db, job)
     db.refresh(job)
     return JobOut.model_validate(job)
