@@ -3,11 +3,15 @@
 The rules, in one place so no route drifts:
 
 * an **admin** (the bootstrap operator) may read and manage every folder;
-* the **library tier** (`developer`, `reviewer`) holds a floor on *every*
-  folder — `editor` for the developer (they delete, move, fork and retry
-  anywhere in the library), `viewer` for the reviewer (they read everywhere
-  and edit any transcript, but destructive routes keep requiring `editor`).
-  Explicit per-folder roles still raise that floor; nothing lowers it;
+* the **library tier** (`developer`, `reviewer`) is **not** granted folder
+  visibility: a private folder with no grant on it stays invisible to them
+  (404, absent from their listings), exactly as for any other account. Their
+  widening is per *capability* and applies only to units they can already
+  see — `require_media_editor`/`require_media_folder` let a developer
+  retry/delete/move/fork the media, `require_transcript_editor` lets a reviewer
+  correct the transcript. Neither grants folder administration: create, rename,
+  delete, share, passcode and member management still need `editor` on that
+  folder (`require_manage`), which the library tier does not hold by role;
 * the **owner** of a folder may manage it; an invited member holds exactly the
   role they were given — viewer < commenter < editor;
 * a **guest** holds the role their passcode or share link was redeemed for,
@@ -32,35 +36,14 @@ from app.errors import AppError
 from app.models import AdminUser, Folder, FolderMember, Video
 from app.roles import (
     ADMIN_TIER,
+    LIBRARY_MEDIA_ROLES,
     OPERATOR_ROLES,
-    ROLE_DEVELOPER,
-    ROLE_REVIEWER,
     ROLE_SUPER_ADMIN,
     TRANSCRIPT_EDIT_ROLES,
 )
 
 # Role strength: "editor can do anything a viewer can" needs no special cases.
 ROLE_RANK = {"viewer": 1, "commenter": 2, "editor": 3}
-
-# The **library tier** (`docs/API_CONTRACT.md` §0, capability matrix): the
-# role each library account holds on *any* folder in the library, with no
-# explicit grant. The developer is the library operator — retry/delete/move/
-# fork anywhere — so their floor is "editor". The reviewer reads every folder
-# and corrects every transcript, but that transcript widening is
-# `require_transcript_editor` (`TRANSCRIPT_EDIT_ROLES`); their folder floor
-# stays "viewer" so every destructive route keeps requiring "editor" and stays
-# closed to them. Everyone else is absent: a plain `user`, a guest, a passcode
-# or share session and the Telegram service resolve only from the per-folder
-# rules below, exactly as before.
-LIBRARY_TIER_ROLES = {
-    ROLE_DEVELOPER: "editor",
-    ROLE_REVIEWER: "viewer",
-}
-
-
-def library_tier_role(principal: Principal) -> Optional[str]:
-    """The floor the caller's account role gives on every folder, if any."""
-    return LIBRARY_TIER_ROLES.get(principal.role)
 
 
 def folder_or_404(db: Session, folder_id: UUID) -> Folder:
@@ -113,11 +96,12 @@ def role_on_folder(
 ) -> Optional[str]:
     """The caller's effective role on `folder`, or None when it is invisible.
 
-    The library tier starts from its floor (`LIBRARY_TIER_ROLES`) rather than
-    from None, so a developer is an editor and a reviewer a viewer everywhere
-    in the library. The per-folder walk below can only raise that floor —
-    ownership, an explicit membership or a scoped token still wins where they
-    grant more — never lower it.
+    Resolution is the account role plus the per-folder walk, nothing else: the
+    admin tier and the Telegram service are editors everywhere; everyone else
+    starts from None and can only gain a role through a scoped token, public
+    visibility, ownership or an explicit membership. The library tier
+    (`developer`, `reviewer`) holds no implicit role on a folder — a private
+    folder with no grant is invisible to them, exactly as to any other account.
     """
     if principal.role in ADMIN_TIER:
         return "editor"
@@ -126,7 +110,7 @@ def role_on_folder(
 
     if user is None:
         user = user_for(db, principal)
-    role: Optional[str] = library_tier_role(principal)
+    role: Optional[str] = None
 
     for node in folder_chain(db, folder):
         if str(node.id) in principal.scoped_folder_ids:
@@ -147,10 +131,11 @@ def visible_folders(db: Session, principal: Principal) -> dict[UUID, str]:
     """Every folder the caller can see, with the role they hold on it.
 
     One query for the folders, one for memberships — cheap for a whole page.
-    The library tier sees the whole folder tree: the developer as an editor
-    everywhere, the reviewer as a viewer whose explicit memberships (an
-    editor grant on one folder) still win. A plain user, a guest and the
-    Telegram person scope get only what the per-folder rules grant.
+    Everyone except the admin tier and the Telegram service gets only what the
+    per-folder rules grant: public visibility, ownership, an explicit
+    membership or a scoped token. The library tier is no different here — a
+    private folder they hold no role on is absent, so the folder tree never
+    leaks its existence or name.
     """
     folders = list(db.execute(select(Folder)).scalars())
     if principal.role in ADMIN_TIER + ("telegram",):
@@ -167,10 +152,9 @@ def visible_folders(db: Session, principal: Principal) -> dict[UUID, str]:
         }
     by_id = {f.id: f for f in folders}
     out: dict[UUID, str] = {}
-    library_role = library_tier_role(principal)
 
     for fid, folder in by_id.items():
-        role: Optional[str] = library_role
+        role: Optional[str] = None
         seen: set[UUID] = set()
         current: Optional[Folder] = folder
         while current is not None and current.id not in seen:
@@ -311,21 +295,32 @@ def require_video(
 def require_media_editor(db: Session, video: Video, principal: Principal) -> str:
     """A media action on one unit: metadata edit, delete, move, retry.
 
-    The "editor" rule on the video's folder, named for what it guards so a
-    route that touches the media does not read like one that administers the
-    folder. The library tier's floor is already resolved by `video_role`, so a
-    developer passes everywhere in the library and a reviewer still needs an
-    explicit editor grant on that folder.
+    Named for what it guards so a route that touches the media does not read
+    like one that administers the folder. A `LIBRARY_MEDIA_ROLES` member
+    (the developer) may act on a unit it can already see, whatever the role
+    that made it visible — public, a viewer membership, ownership. This is the
+    plan's "developer acts on any unit they can see" and it stops exactly
+    there: an invisible unit still fails `require_video`'s 403, and folder
+    administration keeps going through `require_manage`.
     """
+    role = video_role(db, video, principal)
+    if role is not None and principal.role in LIBRARY_MEDIA_ROLES:
+        return role
     return require_video(db, video, principal, need="editor")
 
 
 def require_media_folder(db: Session, folder: Folder, principal: Principal) -> str:
     """Write access to a destination folder for a media action (move/ingest).
 
-    The destination's editor rule, kept under its own name for the same reason
-    as `require_media_editor`.
+    The destination's `require_manage` rule, kept under its own name for the
+    same reason as `require_media_editor`, with the same library-tier widening:
+    a `LIBRARY_MEDIA_ROLES` member whose destination is already visible may
+    file media there. An invisible destination stays a 403, so a developer
+    cannot push a unit into a private folder they hold no role on.
     """
+    role = role_on_folder(db, folder, principal)
+    if role is not None and principal.role in LIBRARY_MEDIA_ROLES:
+        return role
     return require_manage(db, folder, principal)
 
 

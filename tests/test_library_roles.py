@@ -1,17 +1,29 @@
-"""F2: the library tier's floor on every folder (contract §0 role matrix).
+"""The library tier widens media *actions*, never folder visibility (§0).
 
-`role_on_folder` used to resolve a `developer` or `reviewer` with no explicit
-per-folder grant as a plain viewer or as nothing at all. The matrix says the
-developer is the *library operator* — read, edit transcripts, delete, move and
-fork anywhere — and the reviewer reads everywhere and edits any transcript but
-holds no destructive right. These tests drive the real resolution helpers and
-the real guards (`require_read`, `require_transcript_editor`,
-`require_media_editor`, `require_media_folder`, `require_operator`), not mocks,
-so a drift in `access.py` fails here instead of in a router.
+`developer` and `reviewer` hold no implicit role on any folder. A private
+folder with no grant is invisible to them — `role_on_folder` is None, the
+folder is absent from `visible_folders`, and `require_read` answers 404 —
+exactly as for a plain `user` or a guest. What the tier actually buys is
+per-capability:
 
-The critical non-regression is the ordinary `user`: the tier widening must not
-leak into their resolution. A `user`, a guest, a passcode/share session and the
-Telegram service keep exactly the rules they had.
+* `require_media_editor` / `require_media_folder` let a `LIBRARY_MEDIA_ROLES`
+  member (the developer) delete/move/retry/fork the media of a unit it can
+  already see, even when the role that made it visible is only `viewer`. An
+  invisible unit still 403s, so there is nothing there to act on.
+* `require_transcript_editor` lets the reviewer edit any transcript
+  (`TRANSCRIPT_EDIT_ROLES`) — a transcript capability, orthogonal to whether
+  the folder is visible.
+
+Folder administration is untouched: `require_manage` still needs `editor` on
+that folder, which the library tier only holds as owner or with an explicit
+editor grant. These tests drive the real resolution helpers and the real
+guards (`require_read`, `require_manage`, `require_transcript_editor`,
+`require_media_editor`, `require_media_folder`, `require_operator`), not
+mocks, so a drift in `access.py` fails here instead of in a router.
+
+The critical non-regression is the ordinary `user`: nothing widens for them. A
+`user`, a guest, a passcode/share session and the Telegram service keep
+exactly the rules they had.
 """
 from __future__ import annotations
 
@@ -21,6 +33,7 @@ import pytest
 from sqlalchemy import select
 
 from app.access import (
+    require_manage,
     require_media_editor,
     require_media_folder,
     require_operator,
@@ -48,8 +61,17 @@ READ_PUBLIC = {"read": True, "edit_transcript": False, "delete_video": False,
                "move_fork": False, "retry": False}
 READ_ALL = {"read": True, "edit_transcript": True, "delete_video": False,
             "move_fork": False, "retry": False}
+# The reviewer on an invisible private folder: the folder itself is a 404, but
+# transcript editing is a global capability (`TRANSCRIPT_EDIT_ROLES`), so that
+# one column still passes.
+TRANSCRIPT_ONLY = {"read": False, "edit_transcript": True, "delete_video": False,
+                   "move_fork": False, "retry": False}
 EDITOR_NO_OPERATOR = {"read": True, "edit_transcript": True, "delete_video": True,
                       "move_fork": True, "retry": False}
+# The developer on a visible unit: the media widening applies, but transcript
+# editing is a separate role (`TRANSCRIPT_EDIT_ROLES`) they do not hold.
+LIBRARY_MEDIA = {"read": True, "edit_transcript": False, "delete_video": True,
+                 "move_fork": True, "retry": True}
 FULL = {"read": True, "edit_transcript": True, "delete_video": True,
         "move_fork": True, "retry": True}
 NOTHING = dict.fromkeys(CAPABILITIES, False)
@@ -58,13 +80,17 @@ NOTHING = dict.fromkeys(CAPABILITIES, False)
 EXPECTED = {
     "super_admin": {"public": FULL, "private": FULL, "grant": FULL},
     "admin": {"public": FULL, "private": FULL, "grant": FULL},
-    # The library tier: editor everywhere, including a private folder nobody
-    # granted them (the point of F2). A weak explicit grant cannot lower it.
-    "developer": {"public": FULL, "private": FULL, "grant": FULL},
-    # Read + transcript edit everywhere; no destructive right unless an
-    # explicit "editor" grant raises them on that one folder. `retry` also
-    # passes `require_operator`, which the reviewer never holds.
-    "reviewer": {"public": READ_ALL, "private": READ_ALL, "grant": EDITOR_NO_OPERATOR},
+    # The library tier does NOT widen visibility. A developer is a viewer on a
+    # public folder, nothing at all on an ungranted private one (404, not
+    # 403), and a viewer where they hold a viewer grant. The media widening
+    # (`require_media_editor`/`require_media_folder`) is what lets them
+    # delete/move/retry/fork/ingest — only where the unit is already visible;
+    # `retry` also passes `require_operator`, which the developer holds.
+    "developer": {"public": LIBRARY_MEDIA, "private": NOTHING, "grant": LIBRARY_MEDIA},
+    # Visible: read + transcript edit, no destructive right unless an explicit
+    # "editor" grant raises them on that one folder. Invisible: the transcript
+    # widening survives (it is a role, not a folder), nothing else does.
+    "reviewer": {"public": READ_ALL, "private": TRANSCRIPT_ONLY, "grant": EDITOR_NO_OPERATOR},
     # Ordinary member: public read only, nothing on a private folder they hold
     # no role on, and exactly their grant where they hold one.
     "user": {"public": READ_PUBLIC, "private": NOTHING, "grant": EDITOR_NO_OPERATOR},
@@ -135,8 +161,8 @@ def _build(actor: str, scenario: str):
     video_id = _make_video(folder_id)
 
     if scenario == "grant" and account_id is not None:
-        # reviewer/user are raised to editor; the developer is given a *weaker*
-        # grant on purpose so the test proves the tier is not downgraded.
+        # A real grant: viewer for the developer (the media widening must work
+        # at viewer), editor for the reviewer/user (the ordinary role rules).
         _grant(folder_id, account_id, "viewer" if actor == "developer" else "editor")
 
     if actor == "super_admin":
@@ -212,37 +238,90 @@ def test_capability_matrix(actor: str, scenario: str):
 # ------------------------------------------------------- pinned negative cases
 
 
-def test_a_developer_is_an_editor_on_a_private_folder_no_one_granted():
-    """The point of the library tier: destructive rights without a grant."""
-    folder_id, video_id, principal = _build("developer", "private")
-    assert _role(folder_id, principal) == "editor"
-    caps = _capabilities(folder_id, video_id, principal)
-    assert caps["delete_video"] is True
-    assert caps["move_fork"] is True
-    assert caps["retry"] is True
+def test_a_developer_cannot_manage_an_ungranted_private_folder():
+    """The regression: `require_manage` must not pass on a private folder the
+    developer holds no role on. It is a 403 and nothing is renamed/deleted."""
+    folder_id, _, principal = _build("developer", "private")
     with SessionLocal() as db:
-        assert video_role(db, db.get(Video, video_id), principal) == "editor"
+        with pytest.raises(AppError) as denied:
+            require_manage(db, db.get(Folder, folder_id), principal)
+    assert denied.value.status_code == 403
+    assert denied.value.details[0]["role"] is None
+
+
+def test_a_developer_cannot_see_an_ungranted_private_folder():
+    """Invisible means invisible: no role, absent from the listing, 404 on read
+    — the same shape a plain user gets, so existence is not disclosed."""
+    folder_id, video_id, principal = _build("developer", "private")
+    assert _role(folder_id, principal) is None
+    with SessionLocal() as db:
+        assert folder_id not in visible_folders(db, principal)
+        assert video_role(db, db.get(Video, video_id), principal) is None
+        with pytest.raises(AppError) as denied:
+            require_read(db, db.get(Folder, folder_id), principal)
+    assert denied.value.status_code == 404
+
+
+def test_a_developer_cannot_move_a_video_into_an_ungranted_private_folder():
+    """`require_media_folder` widens only for a visible destination. Here the
+    destination is invisible, so a move/ingest/fork into it is a 403 — and so
+    is reading the unit already inside it."""
+    folder_id, video_id, principal = _build("developer", "private")
+    with SessionLocal() as db:
+        with pytest.raises(AppError) as denied:
+            require_media_folder(db, db.get(Folder, folder_id), principal)
+        assert denied.value.status_code == 403
+        with pytest.raises(AppError) as denied_video:
+            require_media_editor(db, db.get(Video, video_id), principal)
+        assert denied_video.value.status_code == 403
+
+
+def test_a_developer_still_acts_on_media_in_a_folder_they_can_see():
+    """The widening itself: at `viewer` (public, or a viewer grant) the
+    developer deletes/moves/retries the media, but the very same folder is
+    still closed to `require_manage` — media actions are not administration."""
+    for scenario in ("public", "grant"):
+        folder_id, video_id, principal = _build("developer", scenario)
+        with SessionLocal() as db:
+            folder = db.get(Folder, folder_id)
+            video = db.get(Video, video_id)
+            assert role_on_folder(db, folder, principal) == "viewer", scenario
+            assert video_role(db, video, principal) == "viewer", scenario
+            assert require_media_editor(db, video, principal) == "viewer", scenario
+            assert require_media_folder(db, folder, principal) == "viewer", scenario
+            require_operator(principal)
+            with pytest.raises(AppError) as denied:
+                require_manage(db, folder, principal)
+            assert denied.value.status_code == 403, scenario
 
 
 def test_a_reviewer_has_no_destructive_right_without_an_editor_grant():
-    """Public and private, granted nothing: read + transcript only."""
-    for scenario in ("public", "private"):
-        folder_id, video_id, principal = _build("reviewer", scenario)
-        caps = _capabilities(folder_id, video_id, principal)
-        assert caps["read"] is True, scenario
-        assert caps["edit_transcript"] is True, scenario
-        assert caps["delete_video"] is False, scenario
-        assert caps["move_fork"] is False, scenario
-        assert caps["retry"] is False, scenario
+    """Public: read + transcript only. Private and ungranted: invisible, so
+    only the global transcript widening still resolves."""
+    public_id, public_video, public_principal = _build("reviewer", "public")
+    caps = _capabilities(public_id, public_video, public_principal)
+    assert caps == READ_ALL
+    for capability in ("delete_video", "move_fork", "retry"):
+        assert caps[capability] is False, capability
+
+    private_id, private_video, private_principal = _build("reviewer", "private")
+    caps = _capabilities(private_id, private_video, private_principal)
+    assert caps == TRANSCRIPT_ONLY
 
 
-def test_a_reviewer_reads_a_private_folder_but_the_media_stays_closed():
-    """The reviewer's library reach is read-only on a private folder they
-    were never granted."""
+def test_a_reviewer_cannot_read_a_private_folder_they_hold_no_role_on():
+    """The reviewer's library reach is *not* read-everywhere: an ungranted
+    private folder is invisible. Transcript editing still works because it is
+    a role capability, not a folder grant."""
     folder_id, video_id, principal = _build("reviewer", "private")
-    assert _role(folder_id, principal) == "viewer"
+    assert _role(folder_id, principal) is None
     with SessionLocal() as db:
-        assert video_role(db, db.get(Video, video_id), principal) == "viewer"
+        assert folder_id not in visible_folders(db, principal)
+        with pytest.raises(AppError) as denied:
+            require_read(db, db.get(Folder, folder_id), principal)
+        assert denied.value.status_code == 404
+        # The transcript route is deliberately orthogonal to visibility.
+        require_transcript_editor(db, db.get(Video, video_id), principal)
 
 
 def test_an_editor_grant_raises_the_reviewer_but_never_the_job_queue():
@@ -256,17 +335,27 @@ def test_an_editor_grant_raises_the_reviewer_but_never_the_job_queue():
     assert caps["retry"] is False
 
 
-def test_a_viewer_grant_does_not_downgrade_the_developer():
-    folder_id, _, principal = _build("developer", "grant")
-    assert _role(folder_id, principal) == "editor"
+def test_a_viewer_grant_gives_the_developer_viewer_not_editor():
+    """A grant is respected as written: viewer stays viewer on the folder, so
+    folder administration stays closed. Only the media widening applies."""
+    folder_id, video_id, principal = _build("developer", "grant")
+    assert _role(folder_id, principal) == "viewer"
     with SessionLocal() as db:
-        assert visible_folders(db, principal)[folder_id] == "editor"
+        assert visible_folders(db, principal)[folder_id] == "viewer"
+        with pytest.raises(AppError) as denied:
+            require_manage(db, db.get(Folder, folder_id), principal)
+    assert denied.value.status_code == 403
+    caps = _capabilities(folder_id, video_id, principal)
+    assert caps["read"] is True
+    assert caps["delete_video"] is True
+    assert caps["move_fork"] is True
+    assert caps["retry"] is True
 
 
 def test_an_ordinary_user_is_still_denied_on_a_private_folder_they_hold_no_role_on():
-    """The regression that matters most: the tier widening must not touch
-    `user`. A private folder with no membership stays invisible (404, not 403),
-    and no capability resolves."""
+    """The regression that matters most: nothing widens for `user`. A private
+    folder with no membership stays invisible (404, not 403), and no
+    capability resolves."""
     folder_id, video_id, principal = _build("user", "private")
     assert _role(folder_id, principal) is None
     assert _capabilities(folder_id, video_id, principal) == NOTHING
@@ -317,11 +406,12 @@ def test_the_admin_tier_and_the_bot_keep_their_resolution():
 # ------------------------------------------------- the listing's role source
 
 
-def test_the_library_tier_sees_the_whole_folder_tree():
+def test_the_library_tier_does_not_widen_the_folder_tree():
     """`visible_folders` is what the folder listing and the listings' scope
-    read. The developer sees every folder as editor; the reviewer as a viewer,
-    raised to editor only where they hold an explicit editor grant. A plain
-    user sees the public folder and their own grant, never the private one."""
+    read. The developer gets public folders at viewer plus their grants —
+    never the ungranted private folder. The reviewer is the same, raised to
+    editor only where they hold an explicit editor grant. A plain user sees
+    the public folder and their own grant, never the private one."""
     owner = _seed_admin_id()
     public = _make_folder(owner, "public", "Public")
     private = _make_folder(owner, "private", "Vault")
@@ -332,6 +422,7 @@ def test_the_library_tier_sees_the_whole_folder_tree():
     reviewer = Principal(f"reviewer:{reviewer_email}", "reviewer", reviewer_email)
 
     developer_id, developer_email = _make_account("developer")
+    _grant(granted, developer_id, "viewer")
     developer = Principal(f"developer:{developer_email}", "developer", developer_email)
 
     user_id, user_email = _make_account("user")
@@ -343,7 +434,8 @@ def test_the_library_tier_sees_the_whole_folder_tree():
         rev_view = visible_folders(db, reviewer)
         user_view = visible_folders(db, user)
 
-    assert dev_view == {public: "editor", private: "editor", granted: "editor"}
-    assert rev_view == {public: "viewer", private: "viewer", granted: "editor"}
+    # The ungranted private folder is absent for the library tier too.
+    assert dev_view == {public: "viewer", granted: "viewer"}
+    assert rev_view == {public: "viewer", granted: "editor"}
     # Unchanged member resolution: private is absent, not merely lower.
     assert user_view == {public: "viewer", granted: "viewer"}
