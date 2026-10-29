@@ -49,6 +49,12 @@ class Settings(BaseSettings):
     google_client_id: Optional[str] = None
     google_client_secret: Optional[str] = None
 
+    # Separate Google OAuth app for Drive storage (optional).
+    # Falls back to google_client_id / google_client_secret when not set,
+    # so a single Google Cloud project can serve both sign-in and Drive.
+    drive_google_client_id: Optional[str] = None
+    drive_google_client_secret: Optional[str] = None
+
     # ---- personal-cloud storage (contributor's own Google Drive / OneDrive) ----
     # A contributor may keep their video bytes on their own cloud instead of the
     # server disk. The OAuth apps are registered by the operator; these are their
@@ -57,6 +63,11 @@ class Settings(BaseSettings):
     onedrive_client_id: Optional[str] = None
     onedrive_client_secret: Optional[str] = None
     onedrive_tenant: str = "common"
+    # AES key for encrypting OAuth refresh tokens at rest.
+    # Generate with: python3 -c "import secrets,base64; print(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode())"
+    # REQUIRED when cloud storage is used. If empty, tokens are stored unencrypted
+    # with a logged warning.
+    cloud_token_key: Optional[str] = None
     # Where the portal (or console) is told to come back after the provider's
     # consent screen. Must be registered as a redirect URI in both OAuth apps.
     drive_oauth_redirect: str = "http://localhost:5174/settings"

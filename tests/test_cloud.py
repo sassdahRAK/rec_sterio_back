@@ -69,6 +69,8 @@ def _fake_refresh_and_upload(monkeypatch, file_id: str = "file-123"):
             expires_at=None,
         ),
     )
+    # Prevent _verify_drive_file from making real HTTP calls during tests.
+    monkeypatch.setattr("app.routers.cloud._verify_drive_file", lambda p, a, f: None)
 
 
 def _fake_download(monkeypatch, body: bytes = b"\x00\x00\x00\x18ftypmp42cloud"):

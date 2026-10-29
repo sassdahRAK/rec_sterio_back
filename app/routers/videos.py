@@ -43,6 +43,7 @@ from app.schemas import (
 from app.roles import ADMIN_TIER, LIBRARY_VIEW_ROLES
 from app.security import detect_platform, enforce_rate_limit, validate_source_url
 from app.services import asr, cloud_providers, storage, zip_export
+from app.services.cloud_providers import decrypt_token
 from app.services.actors import display_name
 from app.worker import queue
 
@@ -814,7 +815,7 @@ def _open_cloud_stream(
     if link is None or not video.drive_file_id:
         raise AppError(404, "not_found", "Media is not available yet for this video.")
     try:
-        access = cloud_providers.refresh_access_token(video.storage_backend, link.refresh_token)
+        access = cloud_providers.refresh_access_token(video.storage_backend, decrypt_token(link.refresh_token))
     except AppError as exc:
         # A dead/revoked grant -> storage unavailable, not an auth error
         raise AppError(

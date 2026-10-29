@@ -121,6 +121,9 @@ _ADDED_COLUMNS = (
     "alter table videos add column if not exists drive_file_id varchar(255)",
     "alter table videos add column if not exists drive_link_id uuid",
     "create index if not exists ix_videos_drive_link_id on videos (drive_link_id)",
+    # One live drive link per (account, provider): enforced at the DB level so
+    # two concurrent connect requests cannot create duplicate rows.
+    "create unique index if not exists ix_drive_links_user_provider on drive_links (user_id, provider)",
 )
 
 

@@ -243,6 +243,7 @@ class CloudUploadIn(BaseModel):
 
     backend: str
     filename: Optional[str] = Field(None, max_length=255)
+    size: Optional[int] = Field(None, ge=1)
 
     @field_validator("backend")
     @classmethod
@@ -257,6 +258,14 @@ class CloudUploadOut(BaseModel):
     upload_url: str
     upload_headers: Dict[str, str]
     expires_at: Optional[UTCDateTime] = None
+
+
+class CompleteCloudUploadIn(BaseModel):
+    """The provider file id for the uploaded video, plus optional client-measured metadata."""
+
+    provider_file_id: str = Field(min_length=1)
+    size: Optional[int] = Field(None, ge=1)
+    checksum_sha256: Optional[str] = None
 
 
 # ---------------------------------------------------------------- videos

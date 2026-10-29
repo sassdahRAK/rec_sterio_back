@@ -96,13 +96,14 @@ def _add_cloud_media(add, unit: str, video) -> None:
     import tempfile
 
     from app.services import cloud_providers
+    from app.services.cloud_providers import decrypt_token
 
     link = video.drive_link
     if link is None or not video.drive_file_id:
         return
     tmp: Optional[Path] = None
     try:
-        access = cloud_providers.refresh_access_token(video.storage_backend, link.refresh_token)
+        access = cloud_providers.refresh_access_token(video.storage_backend, decrypt_token(link.refresh_token))
         read = cloud_providers.open_download(video.storage_backend, access, video.drive_file_id)
         with tempfile.NamedTemporaryFile(delete=False, suffix=".media") as fh:
             tmp = Path(fh.name)

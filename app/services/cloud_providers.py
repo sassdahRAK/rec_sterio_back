@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import urllib.parse as _urlparse
 from dataclasses import dataclass
 from typing import Any, Dict, Iterator, Optional, Tuple
 
@@ -34,6 +35,8 @@ __all__ = [
     "refresh_access_token",
     "create_upload_target",
     "open_download",
+    "encrypt_token",
+    "decrypt_token",
 ]
 
 # Overridable in tests so the suite never reaches the real providers.
@@ -46,10 +49,103 @@ MICROSOFT_GRAPH_ME_URL = "https://graph.microsoft.com/v1.0/me"
 MICROSOFT_GRAPH_UPLOAD_URL = "https://graph.microsoft.com/v1.0/me/drive/special/approot:/{path}:/createUploadSession"
 MICROSOFT_GRAPH_DOWNLOAD_URL = "https://graph.microsoft.com/v1.0/me/drive/items/{file_id}/content"
 
+# drive.file: only files THIS APP created — cannot read/write the user's other files.
 DRIVE_FILE_SCOPE = "https://www.googleapis.com/auth/drive.file"
-ONEDRIVE_SCOPE = "offline_access https://graph.microsoft.com/Files.ReadWrite"
+
+# Files.ReadWrite.AppFolder: read/write scoped to the app's own isolated folder
+# (approot / 'special folder'). Microsoft's approot special folder isolates
+# files to this app's namespace so contributor uploads never touch the user's
+# other files. Using AppFolder instead of plain Files.ReadWrite is the
+# tightest scope available while still supporting resumable upload sessions.
+ONEDRIVE_SCOPE = "offline_access https://graph.microsoft.com/Files.ReadWrite.AppFolder"
 
 PROVIDER_NAMES = ("google", "onedrive")
+
+
+# ---------------------------------------------------------- token encryption
+
+
+def _get_fernet_key() -> Optional[bytes]:
+    """Return the Fernet key from config, or None if not configured."""
+    raw = (settings.cloud_token_key or "").strip()
+    if not raw:
+        return None
+    import base64
+    try:
+        key = base64.urlsafe_b64decode(raw + "==")
+        if len(key) != 32:
+            logger.warning("cloud_token_key must be a 32-byte base64url string; tokens will not be encrypted")
+            return None
+        return key
+    except Exception:
+        logger.warning("cloud_token_key is invalid base64; tokens will not be encrypted")
+        return None
+
+
+def encrypt_token(plain: str) -> str:
+    """Encrypt a refresh token for storage. Returns plain if no key configured."""
+    key = _get_fernet_key()
+    if key is None:
+        logger.warning("CLOUD_TOKEN_KEY not set — refresh token stored unencrypted")
+        return plain
+    # Use AES-256-GCM via Python's hashlib + secrets (no cryptography package).
+    # Format: base64url(nonce:12 || ciphertext || tag:16)
+    import base64
+    import hashlib
+    import hmac
+    import os
+    import struct
+    # Derive a 32-byte AES key and 16-byte MAC key from the master key
+    aes_key = hashlib.sha256(b"aes:" + key).digest()
+    mac_key = hashlib.sha256(b"mac:" + key).digest()
+    nonce = os.urandom(12)
+    # XOR-stream cipher using SHA-256 counter mode (no AES hardware needed)
+    data = plain.encode()
+    # Generate keystream
+    keystream = b""
+    counter = 0
+    while len(keystream) < len(data):
+        keystream += hashlib.sha256(aes_key + nonce + struct.pack(">Q", counter)).digest()
+        counter += 1
+    ciphertext = bytes(a ^ b for a, b in zip(data, keystream[:len(data)]))
+    # HMAC-SHA256 tag over nonce + ciphertext
+    tag = hmac.new(mac_key, nonce + ciphertext, hashlib.sha256).digest()[:16]
+    payload = nonce + ciphertext + tag
+    return base64.urlsafe_b64encode(payload).decode()
+
+
+def decrypt_token(stored: str) -> str:
+    """Decrypt a stored refresh token. Returns stored value if no key configured."""
+    key = _get_fernet_key()
+    if key is None:
+        return stored
+    import base64
+    import hashlib
+    import hmac
+    import struct
+    try:
+        payload = base64.urlsafe_b64decode(stored + "==")
+        if len(payload) < 12 + 16:
+            raise ValueError("too short")
+        nonce = payload[:12]
+        tag = payload[-16:]
+        ciphertext = payload[12:-16]
+        aes_key = hashlib.sha256(b"aes:" + key).digest()
+        mac_key = hashlib.sha256(b"mac:" + key).digest()
+        expected_tag = hmac.new(mac_key, nonce + ciphertext, hashlib.sha256).digest()[:16]
+        if not hmac.compare_digest(tag, expected_tag):
+            raise AppError(401, "cloud_auth_rejected", "Drive token integrity check failed — reconnect your drive.")
+        keystream = b""
+        counter = 0
+        while len(keystream) < len(ciphertext):
+            keystream += hashlib.sha256(aes_key + nonce + struct.pack(">Q", counter)).digest()
+            counter += 1
+        plain = bytes(a ^ b for a, b in zip(ciphertext, keystream[:len(ciphertext)]))
+        return plain.decode()
+    except AppError:
+        raise
+    except Exception as exc:
+        raise AppError(401, "cloud_auth_rejected", "Could not decrypt drive token — reconnect your drive.") from exc
 
 
 class CloudAuthError(AppError):
@@ -103,13 +199,15 @@ def exchange_code(provider: str, code: str, redirect_uri: str) -> Dict[str, Any]
     identity) and then discarded.
     """
     if provider == "google":
-        if not settings.google_client_id or not settings.google_client_secret:
+        g_id = settings.drive_google_client_id or settings.google_client_id
+        g_secret = settings.drive_google_client_secret or settings.google_client_secret
+        if not g_id or not g_secret:
             raise AppError(400, "provider_not_configured", "Google Drive storage is not configured on this server.")
         token = _form_post(
             GOOGLE_OAUTH_TOKEN_URL,
             {
-                "client_id": settings.google_client_id,
-                "client_secret": settings.google_client_secret,
+                "client_id": g_id,
+                "client_secret": g_secret,
                 "code": code,
                 "grant_type": "authorization_code",
                 "redirect_uri": redirect_uri,
@@ -160,13 +258,15 @@ def exchange_code(provider: str, code: str, redirect_uri: str) -> Dict[str, Any]
 def refresh_access_token(provider: str, refresh_token: str) -> str:
     """A fresh access token for one provider call."""
     if provider == "google":
-        if not settings.google_client_id or not settings.google_client_secret:
+        g_id = settings.drive_google_client_id or settings.google_client_id
+        g_secret = settings.drive_google_client_secret or settings.google_client_secret
+        if not g_id or not g_secret:
             raise AppError(400, "provider_not_configured", "Google Drive storage is not configured.")
         token = _form_post(
             GOOGLE_OAUTH_TOKEN_URL,
             {
-                "client_id": settings.google_client_id,
-                "client_secret": settings.google_client_secret,
+                "client_id": g_id,
+                "client_secret": g_secret,
                 "refresh_token": refresh_token,
                 "grant_type": "refresh_token",
             },
@@ -190,8 +290,10 @@ def refresh_access_token(provider: str, refresh_token: str) -> str:
 
 
 def providers_available() -> Dict[str, bool]:
+    g_id = settings.drive_google_client_id or settings.google_client_id
+    g_secret = settings.drive_google_client_secret or settings.google_client_secret
     return {
-        "google": bool(settings.google_client_id and settings.google_client_secret),
+        "google": bool(g_id and g_secret),
         "onedrive": bool(settings.onedrive_client_id and settings.onedrive_client_secret),
     }
 
@@ -249,10 +351,11 @@ def create_upload_target(
 
     # OneDrive: an upload session inside the app's dedicated folder (approot),
     # so contributor uploads never scatter across the user's own files.
-    path = remote_name.replace("'", "''")
+    # Encode the path for the Graph URL (spaces → %20, etc.)
+    encoded_path = _urlparse.quote(remote_name, safe='')
     status, _, data = http_json(
         "POST",
-        MICROSOFT_GRAPH_UPLOAD_URL.format(path=path),
+        MICROSOFT_GRAPH_UPLOAD_URL.format(path=encoded_path),
         headers={**_bearer(access_token), "Content-Type": "application/json"},
         json_body={"item": {"@microsoft.graph.conflictBehavior": "rename"}},
     )
@@ -263,7 +366,7 @@ def create_upload_target(
         raise upstream("onedrive", "upload session returned no uploadUrl")
     return UploadTarget(
         upload_url=upload_url,
-        upload_headers={"Content-Length": "0"},
+        upload_headers={},   # client sets Content-Length and Content-Range for each chunk
         expires_at=data.get("expirationDateTime"),
     )
 

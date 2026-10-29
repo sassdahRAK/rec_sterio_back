@@ -25,17 +25,18 @@ from typing import Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app import schemas
+from app.schemas import CompleteCloudUploadIn
 from app.auth import Principal, get_principal
 from app.config import settings
 from app.db import get_db
 from app.errors import AppError
 from app.models import AdminUser, DriveLink, Video
 from app.services import asr, cloud_providers, storage
+from app.services.cloud_providers import decrypt_token, encrypt_token
 from app.worker import queue
 
 logger = logging.getLogger("recsterio.cloud")
@@ -45,6 +46,35 @@ router = APIRouter(prefix="/cloud", tags=["cloud"])
 # Ingested files land in a dedicated app folder on the user's drive; this name
 # keeps them together and identifiable without touching the user's own files.
 REMOTE_APP_FOLDER = "RecSterio"
+
+
+def _verify_drive_file(provider: str, access_token: str, file_id: str) -> None:
+    """Verify the file exists in the caller's drive and is accessible."""
+    from app.services.http_client import http_json
+    if provider == "google":
+        status, _, data = http_json(
+            "GET",
+            f"https://www.googleapis.com/drive/v3/files/{file_id}?fields=id,name,size",
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        if status == 404:
+            raise AppError(404, "cloud_file_not_found", "The specified file was not found in your Google Drive.")
+        if status == 403:
+            raise AppError(403, "cloud_file_forbidden", "You do not have access to this file in Google Drive.")
+        if status >= 400:
+            raise AppError(422, "cloud_file_invalid", "Could not verify the file in your Google Drive.")
+    else:
+        status, _, data = http_json(
+            "GET",
+            f"https://graph.microsoft.com/v1.0/me/drive/items/{file_id}",
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        if status == 404:
+            raise AppError(404, "cloud_file_not_found", "The specified file was not found in your OneDrive.")
+        if status == 403:
+            raise AppError(403, "cloud_file_forbidden", "You do not have access to this file in OneDrive.")
+        if status >= 400:
+            raise AppError(422, "cloud_file_invalid", "Could not verify the file in your OneDrive.")
 
 
 def _user_for(principal: Principal, db: Session) -> AdminUser:
@@ -152,7 +182,7 @@ def connect_drive(
         db.add(link)
     link.account_email = grant["account_email"]
     link.account_subject = grant.get("account_subject")
-    link.refresh_token = grant["refresh_token"]
+    link.refresh_token = encrypt_token(grant["refresh_token"])
     db.commit()
     db.refresh(link)
     return schemas.DriveLinkOut(
@@ -204,7 +234,8 @@ def start_cloud_upload(
         raise AppError(400, "provider_not_configured", "That provider is not available here.")
 
     mime = mimetypes.guess_type(payload.filename or "")[0] or "application/octet-stream"
-    size_limit = settings.max_upload_mb * 1024 * 1024
+    max_bytes = settings.max_upload_mb * 1024 * 1024
+    declared_size = min(payload.size, max_bytes) if payload.size else max_bytes
 
     video = Video(
         source_url=f"upload://{(payload.filename or 'upload').split('/')[-1]}",
@@ -220,9 +251,9 @@ def start_cloud_upload(
     db.add(video)
     db.flush()
 
-    access = cloud_providers.refresh_access_token(payload.backend, link.refresh_token)
+    access = cloud_providers.refresh_access_token(payload.backend, decrypt_token(link.refresh_token))
     remote = _remote_name(payload.filename, video.id)
-    target = cloud_providers.create_upload_target(payload.backend, access, remote, mime, size_limit)
+    target = cloud_providers.create_upload_target(payload.backend, access, remote, mime, declared_size)
     # The provider file id is known only after the bytes land; `complete` sets it.
     return schemas.CloudUploadOut(
         video_id=video.id,
@@ -230,15 +261,6 @@ def start_cloud_upload(
         upload_headers=target.upload_headers,
         expires_at=target.expires_at,
     )
-
-
-class CompleteCloudUploadIn(BaseModel):
-    """The provider's id for the now-uploaded file, plus optional metadata the
-    client measured while uploading (size, sha256)."""
-
-    provider_file_id: str
-    size: Optional[int] = None
-    checksum_sha256: Optional[str] = None
 
 
 @router.post("/uploads/{video_id}/complete", response_model=schemas.VideoOut)
@@ -268,18 +290,23 @@ def complete_cloud_upload(
     if link is None:
         raise AppError(409, "drive_not_connected", "Reconnect the drive to finish this upload.")
 
-    video.drive_file_id = payload.provider_file_id
-    video.file_size = payload.size
-    video.checksum_sha256 = payload.checksum_sha256
-    video.status = "downloading"
-    db.flush()
-
     # Materialize a temp copy so the existing extract/transcribe pipeline runs
     # unchanged; the copy is removed by `_ensure_audio` once audio.wav exists,
     # and the contributor's drive stays the authoritative source of the bytes.
     temp_media = storage.cloud_media_file(video.id)
     try:
-        access = cloud_providers.refresh_access_token(video.storage_backend, link.refresh_token)
+        access = cloud_providers.refresh_access_token(video.storage_backend, decrypt_token(link.refresh_token))
+        # Verify the file exists in the caller's own drive before trusting the
+        # supplied provider_file_id.  This prevents one user from pointing a
+        # video row at a file they do not own.
+        _verify_drive_file(video.storage_backend, access, payload.provider_file_id)
+
+        video.drive_file_id = payload.provider_file_id
+        video.file_size = payload.size
+        video.checksum_sha256 = payload.checksum_sha256
+        video.status = "downloading"
+        db.flush()
+
         read = cloud_providers.open_download(video.storage_backend, access, video.drive_file_id)
         with temp_media.open("wb") as out:
             for chunk in read.body:
