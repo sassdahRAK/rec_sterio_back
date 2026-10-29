@@ -29,10 +29,12 @@ An ungranted private folder resolves to ``None`` for every non-admin account:
 * the **library tier** (`developer`, `reviewer`) is **not** granted folder
   visibility: a private folder with no grant on it stays invisible to them
   (404, absent from their listings), exactly as for any other account. Their
-  widening is per *capability* and applies only to units they can already
-  see — `require_media_editor`/`require_media_folder` let a developer
-  retry/delete/move/fork the media, `require_transcript_editor` lets a reviewer
-  correct the transcript. Neither grants folder administration: create, rename,
+  widening is per *capability* — `require_media_editor`/`require_media_folder`
+  let a developer retry/delete/move/fork the media of a unit they can already
+  see, while `require_transcript_editor` lets a reviewer correct the transcript
+  of *any* video, whatever folder it lives in (the transcript grant is not
+  conditioned on folder visibility; see :func:`can_edit_transcript`). Neither
+  grants folder administration: create, rename,
   delete, share, passcode and member management still need `editor` on that
   folder (`require_manage`), which the library tier does not hold by role;
 * the **owner** of a folder may manage it; an invited member holds exactly the
