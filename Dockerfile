@@ -10,8 +10,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 # ffmpeg is a system binary the ASR path depends on (16 kHz mono WAV extraction);
 # it is NOT a pip package.
+# nodejs runs yt-dlp's EJS challenge-solver for YouTube — without it YouTube
+# serves no media formats.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg ca-certificates \
+    && apt-get install -y --no-install-recommends ffmpeg ca-certificates nodejs \
     && rm -rf /var/lib/apt/lists/*
 
 RUN groupadd --gid 10001 app \
@@ -29,7 +31,7 @@ COPY app ./app
 #   /data/media  - downloaded media + extracted audio
 #   /data/state  - cross-process worker heartbeat
 #   /data/models - Whisper model cache (re-downloaded otherwise, ~460 MB for `small`)
-RUN mkdir -p /data/media /data/state /data/models && chown -R app:app /data
+RUN mkdir -p /data/media /data/state /data/models /data/cookies && chown -R app:app /data
 USER app
 
 ENV MEDIA_ROOT=/data/media \

@@ -177,8 +177,14 @@ def download(
     source_url: str,
     video_id: UUID | str,
     on_progress: Optional[Callable[[int], None]] = None,
+    cookiefile: Optional[str] = None,
 ) -> DownloadResult:
-    """Download the media into MEDIA_ROOT/{video_id}/media.<ext>."""
+    """Download the media into MEDIA_ROOT/{video_id}/media.<ext>.
+
+    `cookiefile` is the requesting user's own cookies export (per-user
+    session). When it exists it wins over every server-side session setting;
+    yt-dlp would otherwise merge the operator's jar with the user's.
+    """
     outdir = storage.video_dir(video_id)
     reporter = ProgressReporter(on_progress)
 
@@ -207,6 +213,25 @@ def download(
         ],
         "writethumbnail": False,
     }
+
+    if cookiefile:
+        path = Path(cookiefile)
+        if path.exists():
+            # Explicit override: yt-dlp MERGES cookiesfrombrowser with a
+            # cookiefile, which would mix the operator's session into the
+            # user's download. None disables the browser jar; proxy /
+            # user_agent / impersonate still apply.
+            opts["cookiefile"] = str(path)
+            opts["cookiesfrombrowser"] = None
+        else:
+            # The row said there was a session, but the file is gone (e.g.
+            # withdrawn between enqueue and run): fall back to server
+            # defaults rather than failing the download outright.
+            logger.warning(
+                "per-user cookies file %s does not exist; downloading with "
+                "server defaults",
+                path,
+            )
 
     ydl = _build_ydl(opts)
     try:

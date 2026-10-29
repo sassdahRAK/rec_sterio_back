@@ -24,6 +24,8 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+psycopg://postgres:postgres@localhost:5432/recsterio"
     secret_key: str = "change-me-to-a-long-random-string"
     media_root: str = str(BACKEND_DIR / "storage" / "media")
+    # Per-user bot cookies (Netscape exports uploaded through /bot-users).
+    cookies_root: str = str(BACKEND_DIR / "storage" / "cookies")
     admin_email: str = "admin@recsterio.local"
     admin_password: str = "change-me"
     access_token_ttl_minutes: int = 720
@@ -32,10 +34,32 @@ class Settings(BaseSettings):
     # ---- bot / service auth ----
     bot_api_token: str = "replace-me-with-a-shared-service-token"
 
+    # ---- telegram account linking (console <-> bot) ----
+    # Deep-link host for the link flow: the console embeds it as
+    # https://t.me/<username>?start=link-<code>. Leave unset in dev (the
+    # console then shows the bare code); set e.g. TELEGRAM_BOT_USERNAME=
+    # recsteriobot in deploy so the code opens a chat with the bot directly.
+    telegram_bot_username: Optional[str] = None
+    # How long a console-generated link code stays redeemable by the bot.
+    link_code_ttl_minutes: int = 15
+
     # ---- google sign-in (instruction.txt #2) ----
     # Leave the client id empty to disable the "Continue with Google" button; the
     # API then answers with a clear 400 instead of redirecting to a broken URL.
     google_client_id: Optional[str] = None
+    google_client_secret: Optional[str] = None
+
+    # ---- personal-cloud storage (contributor's own Google Drive / OneDrive) ----
+    # A contributor may keep their video bytes on their own cloud instead of the
+    # server disk. The OAuth apps are registered by the operator; these are their
+    # credentials. Leave a provider's client id empty and that provider is not
+    # offered anywhere.
+    onedrive_client_id: Optional[str] = None
+    onedrive_client_secret: Optional[str] = None
+    onedrive_tenant: str = "common"
+    # Where the portal (or console) is told to come back after the provider's
+    # consent screen. Must be registered as a redirect URI in both OAuth apps.
+    drive_oauth_redirect: str = "http://localhost:5174/settings"
     # Where share links send the recipient: the public dataset portal, which is
     # a separate app from the ops console so the console never has to be exposed.
     portal_frontend_url: str = "http://localhost:5174"
@@ -68,6 +92,8 @@ class Settings(BaseSettings):
     # Direct file upload (POST /videos/upload). Ingestion must not depend on a
     # platform's willingness to serve a download.
     max_upload_mb: int = 512
+    # Largest accepted per-user cookies.txt upload (POST /bot-users/{id}/cookies).
+    max_cookies_kb: int = 2048
 
     # ---- worker ----
     worker_poll_seconds: float = 3.0
@@ -107,8 +133,16 @@ class Settings(BaseSettings):
             p = (Path.cwd() / p).resolve()
         return p
 
+    @property
+    def cookies_root_path(self) -> Path:
+        p = Path(self.cookies_root).expanduser()
+        if not p.is_absolute():
+            p = (Path.cwd() / p).resolve()
+        return p
+
     def ensure_dirs(self) -> None:
         self.media_root_path.mkdir(parents=True, exist_ok=True)
+        self.cookies_root_path.mkdir(parents=True, exist_ok=True)
 
 
 @lru_cache(maxsize=1)

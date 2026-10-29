@@ -1,7 +1,7 @@
 """Folders: the unit a dataset is organised, published and exported.
 
 Covers the CRUD surface, the nesting that the ZIP export mirrors, the
-visibility rule (only the operator publishes), the member/comment roles, and
+visibility rule (only the operator publishes), the invite (viewer/commenter/editor) roles, and
 the dataset card listing that both the console and the guest portal read.
 """
 from __future__ import annotations
@@ -17,11 +17,11 @@ from app.models import Folder, Video
 from tests.helpers import (
     bot_headers,
     create_folder,
-    ensure_member,
+    ensure_user,
     guest_headers,
     make_folder,
     make_transcript,
-    member_headers,
+    user_headers,
     upload_video,
 )
 
@@ -49,8 +49,8 @@ def test_create_folder_requires_a_signed_in_user(client):
 def test_only_an_admin_may_publish_a_public_folder(client, auth_headers):
     """A public folder is readable by anonymous visitors, so only the operator
     may create one."""
-    email = ensure_member()
-    resp = create_folder(client, member_headers(email), name="Leak", visibility="public")
+    email = ensure_user()
+    resp = create_folder(client, user_headers(email), name="Leak", visibility="public")
     assert resp.status_code == 403, resp.text
     assert resp.json()["error"]["code"] == "forbidden"
 
@@ -106,30 +106,30 @@ def test_get_folder_includes_its_children(client, auth_headers):
 
 
 def test_a_child_folder_inherits_the_parents_visibility(client, auth_headers):
-    """A member of a private parent may browse its sub-folders (#6)."""
+    """A user given a role on a private parent may browse its sub-folders (#6)."""
     parent = make_folder(client, auth_headers, name="Parent")
     child = make_folder(client, auth_headers, name="Child", parent_id=parent["id"])
-    email = ensure_member()
+    email = ensure_user()
     client.post(
         f"/api/v1/folders/{parent['id']}/members",
         json={"email": email, "role": "viewer"},
         headers=auth_headers,
     )
-    resp = client.get(f"/api/v1/folders/{child['id']}", headers=member_headers(email))
+    resp = client.get(f"/api/v1/folders/{child['id']}", headers=user_headers(email))
     assert resp.status_code == 200, resp.text
     assert resp.json()["my_role"] == "viewer"
 
 
 def test_creating_a_child_requires_manage_on_the_parent(client, auth_headers):
     parent = make_folder(client, auth_headers, name="Parent")
-    email = ensure_member()
+    email = ensure_user()
     client.post(
         f"/api/v1/folders/{parent['id']}/members",
         json={"email": email, "role": "viewer"},
         headers=auth_headers,
     )
     resp = create_folder(
-        client, member_headers(email), name="Sneaky", parent_id=parent["id"]
+        client, user_headers(email), name="Sneaky", parent_id=parent["id"]
     )
     assert resp.status_code == 403
 
@@ -198,24 +198,24 @@ def test_a_folder_cannot_be_its_own_parent(client, auth_headers):
 def test_moving_a_folder_requires_manage_on_the_destination(client, auth_headers):
     source = make_folder(client, auth_headers, name="Source")
     dest = make_folder(client, auth_headers, name="Destination")
-    email = ensure_member()
+    email = ensure_user()
     client.post(
         f"/api/v1/folders/{source['id']}/members",
         json={"email": email, "role": "editor"},
         headers=auth_headers,
     )
-    # The member may move *their* folder, but not into a folder they do not own.
+    # The user may move *their* folder, but not into a folder they do not own.
     resp = client.patch(
         f"/api/v1/folders/{source['id']}",
         json={"parent_id": dest["id"]},
-        headers=member_headers(email),
+        headers=user_headers(email),
     )
     assert resp.status_code == 403
 
 
 def test_only_an_admin_may_make_an_existing_folder_public(client, auth_headers):
     folder = make_folder(client, auth_headers, name="Draft")
-    email = ensure_member()
+    email = ensure_user()
     client.post(
         f"/api/v1/folders/{folder['id']}/members",
         json={"email": email, "role": "editor"},
@@ -224,7 +224,7 @@ def test_only_an_admin_may_make_an_existing_folder_public(client, auth_headers):
     resp = client.patch(
         f"/api/v1/folders/{folder['id']}",
         json={"visibility": "public"},
-        headers=member_headers(email),
+        headers=user_headers(email),
     )
     assert resp.status_code == 403
 
@@ -259,13 +259,13 @@ def test_delete_folder_cascades_to_children_but_keeps_the_videos(client, auth_he
 
 def test_delete_requires_manage(client, auth_headers):
     folder = make_folder(client, auth_headers, name="Keep out")
-    email = ensure_member()
+    email = ensure_user()
     client.post(
         f"/api/v1/folders/{folder['id']}/members",
         json={"email": email, "role": "viewer"},
         headers=auth_headers,
     )
-    resp = client.delete(f"/api/v1/folders/{folder['id']}", headers=member_headers(email))
+    resp = client.delete(f"/api/v1/folders/{folder['id']}", headers=user_headers(email))
     assert resp.status_code == 403
 
 
@@ -295,7 +295,7 @@ def test_place_a_video_into_a_folder_and_back_out(client, auth_headers):
 def test_filing_a_video_requires_manage_on_the_folder(client, auth_headers):
     folder = make_folder(client, auth_headers, name="Dataset")
     video = upload_video(client, auth_headers, title="Unfiled")
-    email = ensure_member()
+    email = ensure_user()
     client.post(
         f"/api/v1/folders/{folder['id']}/members",
         json={"email": email, "role": "viewer"},
@@ -304,7 +304,7 @@ def test_filing_a_video_requires_manage_on_the_folder(client, auth_headers):
     resp = client.put(
         f"/api/v1/videos/{video['id']}/folder",
         json={"folder_id": folder["id"]},
-        headers=member_headers(email),
+        headers=user_headers(email),
     )
     assert resp.status_code == 403
 
@@ -318,7 +318,7 @@ def test_ingesting_directly_into_a_folder(client, auth_headers):
 
 def test_ingesting_into_a_folder_the_caller_cannot_edit_is_refused(client, auth_headers):
     folder = make_folder(client, auth_headers, name="Dataset")
-    email = ensure_member()
+    email = ensure_user()
     client.post(
         f"/api/v1/folders/{folder['id']}/members",
         json={"email": email, "role": "viewer"},
@@ -330,7 +330,7 @@ def test_ingesting_into_a_folder_the_caller_cannot_edit_is_refused(client, auth_
         "/api/v1/videos/upload",
         files={"file": ("clip.mp4", MEDIA_BYTES, "video/mp4")},
         data={"folder_id": folder["id"]},
-        headers=member_headers(email),
+        headers=user_headers(email),
     )
     assert resp.status_code == 403
 
@@ -409,6 +409,33 @@ def test_dataset_cards_narrow_to_one_folder(client, auth_headers):
     assert [c["title"] for c in resp.json()["items"]] == ["In A"]
 
 
+def test_dataset_cards_can_select_a_single_unit(client, auth_headers):
+    """The portal's per-video page (and the bot's button) resolves one unit."""
+    folder = make_folder(client, auth_headers, name="Dataset")
+    wanted = upload_video(client, auth_headers, folder_id=folder["id"], title="Wanted")
+    upload_video(client, auth_headers, folder_id=folder["id"], title="Other")
+
+    resp = client.get(
+        "/api/v1/dataset/cards", params={"video_id": wanted["id"]}, headers=auth_headers
+    )
+    body = resp.json()
+    assert body["total"] == 1
+    assert [c["video_id"] for c in body["items"]] == [wanted["id"]]
+    assert body["items"][0]["title"] == "Wanted"
+
+
+def test_selecting_one_unit_still_honours_visibility(client, auth_headers):
+    """A unit in a private folder is not disclosed to a guest by its id."""
+    private = make_folder(client, auth_headers, name="Secret")
+    hidden = upload_video(client, auth_headers, folder_id=private["id"], title="Hidden")
+
+    resp = client.get(
+        "/api/v1/dataset/cards", params={"video_id": hidden["id"]}, headers=guest_headers()
+    )
+    assert resp.status_code == 200
+    assert resp.json()["items"] == []
+
+
 def test_a_stranger_only_sees_cards_from_public_folders(client, auth_headers):
     """The guest portal must not leak a private folder's videos."""
     public = make_folder(client, auth_headers, name="Open", visibility="public")
@@ -421,11 +448,11 @@ def test_a_stranger_only_sees_cards_from_public_folders(client, auth_headers):
     assert [c["title"] for c in resp.json()["items"]] == ["Visible"]
 
 
-def test_a_member_sees_their_own_unfiled_videos(client, auth_headers):
+def test_a_user_sees_their_own_unfiled_videos(client, auth_headers):
     """The ingesting account keeps access to what it filed, even unfiled."""
-    email = ensure_member()
-    upload_video(client, member_headers(email), title="Mine")
-    resp = client.get("/api/v1/dataset/cards", headers=member_headers(email))
+    email = ensure_user()
+    upload_video(client, user_headers(email), title="Mine")
+    resp = client.get("/api/v1/dataset/cards", headers=user_headers(email))
     assert [c["title"] for c in resp.json()["items"]] == ["Mine"]
 
 
@@ -479,7 +506,7 @@ def test_invite_rejects_a_malformed_email(client, auth_headers):
 
 def test_invite_requires_manage_on_the_folder(client, auth_headers):
     folder = make_folder(client, auth_headers, name="Dataset")
-    email = ensure_member()
+    email = ensure_user()
     client.post(
         f"/api/v1/folders/{folder['id']}/members",
         json={"email": email, "role": "viewer"},
@@ -488,7 +515,7 @@ def test_invite_requires_manage_on_the_folder(client, auth_headers):
     resp = client.post(
         f"/api/v1/folders/{folder['id']}/members",
         json={"email": "another@test.local"},
-        headers=member_headers(email),
+        headers=user_headers(email),
     )
     assert resp.status_code == 403
 
@@ -557,9 +584,9 @@ def test_a_viewer_cannot_read_the_member_list_of_a_folder_they_are_not_in(
     client, auth_headers
 ):
     folder = make_folder(client, auth_headers, name="Dataset")
-    email = ensure_member()
+    email = ensure_user()
     resp = client.get(
-        f"/api/v1/folders/{folder['id']}/members", headers=member_headers(email)
+        f"/api/v1/folders/{folder['id']}/members", headers=user_headers(email)
     )
     assert resp.status_code == 404
 
@@ -569,8 +596,8 @@ def test_a_viewer_cannot_read_the_member_list_of_a_folder_they_are_not_in(
 
 def test_a_commenter_may_comment_but_a_viewer_may_not(client, auth_headers):
     folder = make_folder(client, auth_headers, name="Dataset")
-    commenter = ensure_member("commenter")
-    viewer = ensure_member("viewer")
+    commenter = ensure_user("commenter")
+    viewer = ensure_user("viewer")
     for email, role in ((commenter, "commenter"), (viewer, "viewer")):
         client.post(
             f"/api/v1/folders/{folder['id']}/members",
@@ -581,7 +608,7 @@ def test_a_commenter_may_comment_but_a_viewer_may_not(client, auth_headers):
     denied = client.post(
         f"/api/v1/folders/{folder['id']}/comments",
         json={"body": "nice"},
-        headers=member_headers(viewer),
+        headers=user_headers(viewer),
     )
     assert denied.status_code == 403
     assert denied.json()["error"]["details"][0]["role"] == "viewer"
@@ -589,7 +616,7 @@ def test_a_commenter_may_comment_but_a_viewer_may_not(client, auth_headers):
     allowed = client.post(
         f"/api/v1/folders/{folder['id']}/comments",
         json={"body": "nice"},
-        headers=member_headers(commenter),
+        headers=user_headers(commenter),
     )
     assert allowed.status_code == 201, allowed.text
     assert allowed.json()["body"] == "nice"
@@ -597,13 +624,13 @@ def test_a_commenter_may_comment_but_a_viewer_may_not(client, auth_headers):
 
 def test_comments_are_listed_oldest_first(client, auth_headers):
     folder = make_folder(client, auth_headers, name="Dataset", visibility="public")
-    email = ensure_member()
+    email = ensure_user()
     client.post(
         f"/api/v1/folders/{folder['id']}/members",
         json={"email": email, "role": "commenter"},
         headers=auth_headers,
     )
-    headers = member_headers(email)
+    headers = user_headers(email)
     client.post(f"/api/v1/folders/{folder['id']}/comments", json={"body": "first"}, headers=headers)
     client.post(f"/api/v1/folders/{folder['id']}/comments", json={"body": "second"}, headers=headers)
 

@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from uuid import UUID
 
 from fastapi import APIRouter, Depends
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.access import folder_or_404, require_manage
@@ -135,9 +135,18 @@ def revoke_passcode(
 
 
 def redeem_passcode(
-    db: Session, folder_id: UUID, code: str, device_key: str | None
+    db: Session,
+    code: str,
+    device_key: str | None,
+    folder_id: UUID | None = None,
+    folder_name: str | None = None,
 ) -> Folder:
     """Validate a passcode and consume one use. Returns the opened folder.
+
+    The folder is identified by the id from a link, by its name typed in, or by
+    the code alone — never by listing folders. A public list of folders would
+    tell every visitor how many folders exist and what they are called, which
+    is exactly what a private folder must not disclose.
 
     Raises AppError(401) for every failure so a wrong code, an expired code and
     a revoked code are indistinguishable to the caller.
@@ -145,13 +154,27 @@ def redeem_passcode(
     now = datetime.now(timezone.utc)
     wanted = hash_code(code)
 
-    candidates = db.execute(
-        select(FolderPasscode).where(
-            FolderPasscode.folder_id == folder_id,
-            FolderPasscode.revoked_at.is_(None),
+    statement = select(FolderPasscode).where(
+        FolderPasscode.revoked_at.is_(None),
+        FolderPasscode.code_hash == wanted,
+    )
+    if folder_id is not None:
+        statement = statement.where(FolderPasscode.folder_id == folder_id)
+    if folder_name:
+        statement = statement.join(
+            Folder, Folder.id == FolderPasscode.folder_id
+        ).where(func.lower(Folder.name) == folder_name.strip().lower())
+
+    matches = db.execute(statement).scalars().all()
+    if len(matches) > 1:
+        # Two folders share this code and the caller named neither precisely.
+        # Say only that, never which folders matched.
+        raise AppError(
+            422,
+            "ambiguous_folder",
+            "More than one folder matches. Open the link your host sent you instead.",
         )
-    ).scalars().all()
-    passcode = next((p for p in candidates if p.code_hash == wanted), None)
+    passcode = matches[0] if matches else None
 
     if passcode is None:
         raise AppError(401, "unauthorized", "That passcode is not valid.")
@@ -183,7 +206,7 @@ def redeem_passcode(
             db.add(
                 PasscodeGrant(
                     passcode_id=passcode.id,
-                    folder_id=folder_id,
+                    folder_id=passcode.folder_id,
                     device_key_hash=device_hash,
                 )
             )
@@ -195,4 +218,4 @@ def redeem_passcode(
         passcode.revoked_at = now
     db.commit()
 
-    return folder_or_404(db, folder_id)
+    return folder_or_404(db, passcode.folder_id)

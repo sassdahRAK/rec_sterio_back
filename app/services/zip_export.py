@@ -85,6 +85,47 @@ def transcript_text(transcript: Optional[Transcript]) -> str:
     return (transcript.content or "").strip()
 
 
+def _add_cloud_media(add, unit: str, video) -> None:
+    """Spool a cloud-stored video to a temp file and add it under `unit/video/`.
+
+    Skipped silently when the drive link is dead or the file unreadable: the
+    ZIP is a best-effort export, and an unavailable unit simply contributes no
+    video entry, the same way a transcript-less unit contributes no transcript.
+    """
+    import mimetypes as _mt
+    import tempfile
+
+    from app.services import cloud_providers
+
+    link = video.drive_link
+    if link is None or not video.drive_file_id:
+        return
+    tmp: Optional[Path] = None
+    try:
+        access = cloud_providers.refresh_access_token(video.storage_backend, link.refresh_token)
+        read = cloud_providers.open_download(video.storage_backend, access, video.drive_file_id)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".media") as fh:
+            tmp = Path(fh.name)
+            for chunk in read.body:
+                fh.write(chunk)
+        # Use the original filename extension if we can determine it, else .mp4
+        ext = _mt.guess_extension(video.mime_type or "video/mp4") or ".mp4"
+        # Normalise common aliases
+        if ext in (".jpe", ".jpeg"):
+            ext = ".jpg"
+        if ext == ".mpeg":
+            ext = ".mp4"
+        add(f"{unit}/video/media{ext}", tmp)
+    except ValueError:
+        # ValueError from add() means archive limit reached — re-raise
+        raise
+    except Exception:  # noqa: BLE001 — best-effort export, never fail the ZIP
+        logger.warning("cloud media skipped for %s in ZIP export", video.id)
+    finally:
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
+
+
 def build_folder_zip(db: Session, folder: Folder, dest: Path) -> int:
     """Write `folder` and its descendants to `dest`. Returns the entry count."""
     written = 0
@@ -116,6 +157,11 @@ def build_folder_zip(db: Session, folder: Folder, dest: Path) -> int:
                 media = storage.find_media_file(video.id)
                 if media is not None and media.exists():
                     add(f"{unit}/video/{media.name}", media)
+                elif video.storage_backend:
+                    # Bytes live in the contributor's drive; pull them through
+                    # the same reader playback uses, spool to a temp file so the
+                    # existing caps (entries, total bytes) apply unchanged.
+                    _add_cloud_media(add, unit, video)
                 audio = storage.audio_file(video.id)
                 if audio.exists():
                     add(f"{unit}/audio/{storage.AUDIO_FILENAME}", audio)

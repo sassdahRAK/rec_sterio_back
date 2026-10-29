@@ -8,11 +8,11 @@ from fastapi import APIRouter, Depends
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.access import require_video
+from app.access import require_transcript_editor, require_video
 from app.auth import Principal, get_optional_principal, get_principal
 from app.db import get_db
 from app.errors import AppError
-from app.models import Transcript, Video
+from app.models import Job, Transcript, Video
 from app.schemas import (
     GenerateRequest,
     GenerateResponse,
@@ -107,7 +107,7 @@ def update_transcript(
     the caller says otherwise.
     """
     video = _get_video(db, video_id)
-    require_video(db, video, principal, need="editor")
+    require_transcript_editor(db, video, principal)
     if payload.content is None or not payload.content.strip():
         raise AppError(
             422,
@@ -145,7 +145,7 @@ def set_transcript_cleaned(
 ) -> TranscriptOut:
     """Flag the current version as Cleaned (or back to Raw) without a new version."""
     video = _get_video(db, video_id)
-    require_video(db, video, principal, need="editor")
+    require_transcript_editor(db, video, principal)
     transcript = _current_transcript(db, video_id)
     if transcript is None:
         raise AppError(404, "not_found", "No transcript exists for this video.")
@@ -164,7 +164,28 @@ def generate_transcript(
 ) -> GenerateResponse:
     """Enqueue transcription work (whisper / gemini / both)."""
     video = _get_video(db, video_id)
-    require_video(db, video, principal, need="editor")
+    require_transcript_editor(db, video, principal)
+
+    # A double-tapped "Transcribe again" must not start two ASR runs over the
+    # same media: two workers would write transcript versions that race each
+    # other, and the second is pure GPU time.
+    in_progress = db.execute(
+        select(Job)
+        .where(
+            Job.video_id == video.id,
+            Job.kind.in_(("extract_audio", "transcribe", "gemini_transcribe")),
+            Job.status.in_(("queued", "running")),
+        )
+        .order_by(Job.created_at.desc())
+    ).scalars().first()
+    if in_progress is not None:
+        raise AppError(
+            409,
+            "job_in_progress",
+            "Transcription for this video is already queued or running.",
+            [{"job_id": str(in_progress.id), "kind": in_progress.kind, "status": in_progress.status}],
+        )
+
     jobs = []
     if payload.engine in ("whisper", "both"):
         jobs.append(

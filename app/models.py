@@ -43,6 +43,13 @@ class Video(Base):
         UUID(as_uuid=True), ForeignKey("folders.id", ondelete="SET NULL"), nullable=True, index=True
     )
     position: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Provenance for a fork: the video this row was copied from. NULL means the
+    # row was ingested, not copied. A copy is a *view* of the same media, so it
+    # never carries `tvna_serial` (unique, and it names the item in the world,
+    # not the row) and it is excluded from the ingestion de-duplication lookups.
+    copied_from_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("videos.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending", index=True)
     progress: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -53,6 +60,17 @@ class Video(Base):
     duration_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
     mime_type: Mapped[str | None] = mapped_column(String(128), nullable=True)
     checksum_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    # Personal-cloud storage: when `storage_backend` is set, the bytes live in
+    # the contributor's own drive at `drive_file_id` (via `drive_link_id`), and
+    # `local_path` stays NULL. Readers that need the bytes check the cloud
+    # first; a missing/dead link makes the unit "unavailable", not a 500.
+    storage_backend: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    drive_file_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    drive_link_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("drive_links.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     thumbnail_url: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # ---- Telegram mirror (instruction.txt #4) ----
@@ -86,6 +104,7 @@ class Video(Base):
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
     )
 
+    drive_link: Mapped["DriveLink | None"] = relationship()
     transcripts: Mapped[list["Transcript"]] = relationship(
         back_populates="video", cascade="all, delete-orphan", passive_deletes=True
     )
@@ -195,6 +214,10 @@ class AdminUser(Base):
     google_sub: Mapped[str | None] = mapped_column(String(255), nullable=True, unique=True, index=True)
     role: Mapped[str] = mapped_column(String(32), nullable=False, default="admin")
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    # The Telegram account this console account is linked to (the /link flow).
+    # Telegram user ids are 64-bit, and unique: one Telegram account may be
+    # bound to at most one console account, enforced at the database.
+    telegram_user_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True, unique=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -335,3 +358,81 @@ class FolderComment(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
 
     author: Mapped[AdminUser | None] = relationship()
+
+
+class BotUser(Base):
+    """A Telegram user of the bot: their consent record and cookies file.
+
+    The bot forwards user actions with the shared service token plus an
+    `X-Requested-By: telegram:<id>` header; this row turns that id into a
+    consent trail. The cookies file itself stays on disk (one 0600 file per
+    user under storage/cookies) — only its checksum is recorded here.
+    """
+
+    __tablename__ = "bot_users"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    # Telegram user ids are 64-bit; store the numeric id, not the handle.
+    telegram_user_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True, nullable=False)
+    consented: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    consent_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    consented_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    cookies_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    cookies_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class DriveLink(Base):
+    """One console account's connected personal cloud (Google Drive / OneDrive).
+
+    The contributor chooses on upload where the bytes live; a video whose
+    `storage_backend` is set points at `drive_file_id` in this link's drive and
+    is streamed through the API on playback. The OAuth refresh token is the one
+    secret this table holds — `DriveLinkOut` never carries it.
+    """
+
+    __tablename__ = "drive_links"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("admin_users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    provider: Mapped[str] = mapped_column(String(16), nullable=False)  # google | onedrive
+    # Google: the email; Microsoft: the userPrincipalName.
+    account_email: Mapped[str] = mapped_column(String(255), nullable=False)
+    # Microsoft Graph only: the user/tenant ids that own the uploaded file.
+    account_subject: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # One live link per (user, provider): reconnecting replaces the tokens.
+    refresh_token: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class LinkCode(Base):
+    """A one-time code that binds a Telegram account to a console account.
+
+    The console generates one after sign-in and shows it exactly once; the bot
+    later redeems it on behalf of the Telegram user who typed it in. Only the
+    sha256 hash is stored — like a folder passcode, a database leak must not
+    leak outstanding codes. Revoking at issue time keeps a single live code per
+    account, so a code left on a screen cannot be redeemed later.
+    """
+
+    __tablename__ = "link_codes"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    code_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
+    admin_user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("admin_users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

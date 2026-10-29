@@ -24,6 +24,7 @@ from app.access import (
     require_read,
     require_video,
     user_for,
+    video_role,
     visible_folders,
 )
 from app.auth import Principal, get_optional_principal, get_principal
@@ -38,6 +39,7 @@ from app.models import (
     Transcript,
     Video,
 )
+from app.roles import ADMIN_TIER, LIBRARY_VIEW_ROLES, ROLE_USER
 from app.schemas import (
     DataCardOut,
     DatasetCardListOut,
@@ -56,6 +58,7 @@ from app.schemas import (
     VideoOut,
 )
 from app.services import storage, zip_export
+from app.services.storage import cloud_storage_available
 
 logger = logging.getLogger("recsterio.folders")
 
@@ -88,7 +91,7 @@ def _current_user(db: Session, principal: Principal) -> AdminUser:
         if admin is None:
             admin = db.execute(
                 select(AdminUser)
-                .where(AdminUser.role == "admin")
+                .where(AdminUser.role.in_(ADMIN_TIER))
                 .order_by(AdminUser.created_at)
             ).scalars().first()
         if admin is None:
@@ -207,7 +210,7 @@ def create_folder(
     # Only the operator publishes to anonymous visitors. The bot counts: its
     # commands are gated by ADMIN_TELEGRAM_IDS, and it can already issue share
     # links and passcodes for the folder.
-    if payload.visibility == "public" and principal.role not in ("admin", "telegram"):
+    if payload.visibility == "public" and principal.role not in ADMIN_TIER + ("telegram",):
         raise AppError(
             403, "forbidden", "Only an admin can create a public folder.",
             [{"field": "visibility"}],
@@ -293,7 +296,7 @@ def update_folder(
                 "A folder cannot be moved into its own sub-folder.",
                 [{"field": "parent_id", "issue": "descendant_reference"}],
             )
-    if data.get("visibility") == "public" and principal.role != "admin":
+    if data.get("visibility") == "public" and principal.role not in ADMIN_TIER:
         raise AppError(
             403, "forbidden", "Only an admin can make a folder public.",
             [{"field": "visibility"}],
@@ -375,7 +378,9 @@ def place_video(
 # ----------------------------------------------------------- dataset cards
 
 
-def _card(db: Session, video: Video, folder: Optional[Folder]) -> DataCardOut:
+def _card(
+    db: Session, video: Video, folder: Optional[Folder], principal: Principal
+) -> DataCardOut:
     transcript = zip_export.current_transcript(db, video.id)
     preview = None
     if transcript is not None and transcript.content:
@@ -390,6 +395,7 @@ def _card(db: Session, video: Video, folder: Optional[Folder]) -> DataCardOut:
         thumbnail_url=video.thumbnail_url,
         folder_id=video.folder_id,
         folder_name=folder.name if folder else None,
+        copied_from_id=video.copied_from_id,
         badge="cleaned" if transcript is not None and transcript.cleaned else "raw",
         transcript_id=transcript.id if transcript else None,
         transcript_preview=preview,
@@ -397,12 +403,20 @@ def _card(db: Session, video: Video, folder: Optional[Folder]) -> DataCardOut:
         media_url=f"{base}/media",
         audio_url=f"{base}/audio",
         transcript_url=f"{base}/transcript",
+        storage_backend=video.storage_backend,
+        storage_available=cloud_storage_available(video),
+        # Same per-row check `GET /videos/{id}` runs, kept so consumers can
+        # tell an openable card from a locked one; the listing now filters
+        # unopenable cards out before it gets here, so it is True for every
+        # card this route returns.
+        can_open=video_role(db, video, principal) is not None,
     )
 
 
 @router.get("/dataset/cards", response_model=DatasetCardListOut)
 def list_dataset_cards(
     folder_id: Optional[UUID] = None,
+    video_id: Optional[UUID] = None,
     cleaned: Optional[bool] = None,
     q: Optional[str] = None,
     page: int = Query(1, ge=1),
@@ -414,13 +428,18 @@ def list_dataset_cards(
 
     Guests see the public folders and nothing else; a passcode token narrows
     this to the folders it was scoped to.
+
+    ``video_id`` selects exactly one unit — it is what the public portal's
+    per-video page and the bot's portal button resolve to. It is applied to the
+    same visibility query as everything else, so a unit the caller may not read
+    simply yields an empty list rather than disclosing that it exists.
     """
     roles = visible_folders(db, principal)
     if folder_id is not None:
         folder = folder_or_404(db, folder_id)
         require_read(db, folder, principal)
 
-    if principal.role in ("admin", "telegram"):
+    if principal.role in LIBRARY_VIEW_ROLES + ("telegram",):
         stmt = select(Video)
     else:
         accessible = list(roles.keys())
@@ -431,11 +450,24 @@ def list_dataset_cards(
 
     if folder_id is not None:
         stmt = stmt.where(Video.folder_id == folder_id)
+    if video_id is not None:
+        stmt = stmt.where(Video.id == video_id)
     if q:
         pattern = f"%{q.strip()}%"
         stmt = stmt.where(or_(Video.title.ilike(pattern), Video.source_url.ilike(pattern)))
     stmt = stmt.order_by(Video.created_at.desc())
     videos = list(db.execute(stmt).scalars())
+
+    # A card whose video would only 403 on the detail view is not listed at
+    # all, rather than shown unopenable. The developer/reviewer tiers query
+    # the whole library, so this is where their private-folder rows go; the
+    # check (`video_role`, the same one `GET /videos/{id}` runs) cannot run
+    # in SQL, but the page is already assembled in Python below, so filtering
+    # here keeps `total` and the page coherent. The admin tier and the bot
+    # pass it unconditionally; a plain user's or guest's scope already agrees
+    # with it.
+    if principal.role not in ADMIN_TIER + ("telegram",):
+        videos = [v for v in videos if video_role(db, v, principal) is not None]
 
     if cleaned is not None:
         filtered = []
@@ -453,7 +485,7 @@ def list_dataset_cards(
     total = len(videos)
     start = (page - 1) * page_size
     items = [
-        _card(db, video, names.get(video.folder_id))
+        _card(db, video, names.get(video.folder_id), principal)
         for video in videos[start : start + page_size]
     ]
     return DatasetCardListOut(items=items, total=total, page=page, page_size=page_size)
@@ -511,7 +543,7 @@ def invite_member(
         select(AdminUser).where(AdminUser.email == email)
     ).scalar_one_or_none()
     if user is None:
-        user = AdminUser(email=email, role="member", password_hash=None)
+        user = AdminUser(email=email, role=ROLE_USER, password_hash=None)
         db.add(user)
         db.flush()
 

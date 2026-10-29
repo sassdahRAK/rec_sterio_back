@@ -86,6 +86,16 @@ class AppError(Exception):
         )
 
 
+def upstream(provider: str, what: str, detail: str = "") -> AppError:
+    """A 5xx-class failure talking to an external provider (Drive, Graph…).
+
+    One constructor keeps the "the provider is having trouble, not your
+    request" shape consistent, and never echoes tokens or request bodies.
+    """
+    message = f"{provider} {what}." if not detail else f"{provider} {what}: {detail}."
+    return AppError(502, "upstream_error", message)
+
+
 def register_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(AppError)
     async def _app_error(request: Request, exc: AppError):  # noqa: ANN202

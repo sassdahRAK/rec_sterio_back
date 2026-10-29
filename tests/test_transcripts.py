@@ -22,7 +22,7 @@ def test_put_transcript_creates_version_1_then_2(client, auth_headers):
     body = first.json()
     assert body["version"] == 1
     assert body["source"] == "manual"
-    assert body["created_by"] == "admin:admin@test.local"
+    assert body["created_by"] == "super_admin:admin@test.local"
 
     second = client.put(
         f"/api/v1/videos/{video['id']}/transcript",
@@ -111,6 +111,20 @@ def test_segments_endpoint(client, auth_headers):
     assert segments[0]["start"] == 0.0
 
 
+def _drain_jobs(video_id: str) -> None:
+    """Finish the queued jobs so the next generate call is not refused."""
+    from sqlalchemy import select as _select
+
+    from app.db import SessionLocal as _SessionLocal
+    from app.models import Job as _Job
+
+    with _SessionLocal() as db:
+        for job in db.execute(_select(_Job).where(_Job.video_id == video_id)).scalars():
+            if job.status in ("queued", "running"):
+                job.status = "succeeded"
+        db.commit()
+
+
 def test_generate_enqueues_jobs_per_engine(client, auth_headers):
     video = _create_video(client, auth_headers)
 
@@ -125,6 +139,18 @@ def test_generate_enqueues_jobs_per_engine(client, auth_headers):
     assert jobs[0]["kind"] == "extract_audio"
     assert jobs[0]["payload"]["chain"] == ["transcribe"]
 
+    # A second tap while that run is still queued would start a rival ASR run
+    # over the same media — the double-tapped "Transcribe again" button.
+    double_tap = client.post(
+        f"/api/v1/videos/{video['id']}/transcript/generate",
+        json={"engine": "gemini"},
+        headers=auth_headers,
+    )
+    assert double_tap.status_code == 409, double_tap.text
+    assert double_tap.json()["error"]["code"] == "job_in_progress"
+
+    _drain_jobs(video["id"])
+
     gemini = client.post(
         f"/api/v1/videos/{video['id']}/transcript/generate",
         json={"engine": "gemini"},
@@ -132,6 +158,8 @@ def test_generate_enqueues_jobs_per_engine(client, auth_headers):
     )
     assert gemini.status_code == 202
     assert gemini.json()["jobs"][0]["kind"] == "gemini_transcribe"
+
+    _drain_jobs(video["id"])
 
     both = client.post(
         f"/api/v1/videos/{video['id']}/transcript/generate",

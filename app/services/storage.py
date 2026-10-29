@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import mimetypes
+import os
 import shutil
 from pathlib import Path
 from typing import Iterator, Optional
@@ -11,6 +12,7 @@ from uuid import UUID
 from app.config import settings
 
 AUDIO_FILENAME = "audio.wav"
+AUDIO_MP3_FILENAME = "audio.mp3"
 MEDIA_STEM = "media"
 
 
@@ -26,6 +28,18 @@ def video_dir(video_id: UUID | str) -> Path:
     return d
 
 
+def cookies_root() -> Path:
+    """Per-user bot cookies dir; created on demand."""
+    root = settings.cookies_root_path
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def cookie_file(telegram_id: int) -> Path:
+    """The Netscape cookies.txt one Telegram user uploaded via the bot."""
+    return cookies_root() / f"{telegram_id}.txt"
+
+
 def media_file(video_id: UUID | str, ext: str | None = None) -> Path:
     d = video_dir(video_id)
     if ext:
@@ -38,14 +52,36 @@ def find_media_file(video_id: UUID | str) -> Optional[Path]:
     d = media_root() / str(video_id)
     if not d.exists():
         return None
+    candidates = []
     for p in sorted(d.iterdir()):
-        if p.is_file() and p.stem == MEDIA_STEM and p.suffix.lower() != ".part":
+        if p.is_file() and p.stem == MEDIA_STEM and p.suffix.lower() not in (".part", ".cloud-tmp"):
+            candidates.append(p)
+    if candidates:
+        return candidates[0]
+    # Fall back to cloud-tmp only when no real file exists
+    for p in sorted(d.iterdir()):
+        if p.is_file() and p.stem == MEDIA_STEM and p.suffix.lower() == ".cloud-tmp":
             return p
     return None
 
 
+def cloud_media_file(video_id: UUID | str) -> Path:
+    """Temp local copy of a cloud-stored video, for the extract/transcribe pipeline.
+
+    The authoritative bytes live in the contributor's drive; this file exists
+    only while the pipeline needs a local path, and is deleted once audio.wav
+    exists (see `runner._ensure_audio`).
+    """
+    return video_dir(video_id) / f"{MEDIA_STEM}.cloud-tmp"
+
+
 def audio_file(video_id: UUID | str) -> Path:
     return video_dir(video_id) / AUDIO_FILENAME
+
+
+def audio_mp3_file(video_id: UUID | str) -> Path:
+    """The .mp3 listening copy (not an ASR artifact — that is audio.wav)."""
+    return video_dir(video_id) / AUDIO_MP3_FILENAME
 
 
 def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
@@ -75,6 +111,46 @@ def delete_video_files(video_id: UUID | str) -> None:
     d = media_root() / str(video_id)
     if d.exists():
         shutil.rmtree(d, ignore_errors=True)
+
+
+def clone_video_files(source_id: UUID | str, dest_id: UUID | str) -> int:
+    """Populate a copy's media dir with links to the source's files.
+
+    Hard links, not byte copies: both directory entries point at the same
+    inode, so a fork costs no disk and no re-download. Deletion stays correct
+    without reference counting, because `delete_video_files` removes a
+    directory and only that directory's link — the other row keeps its own.
+    Across filesystems `os.link` raises EXDEV, so fall back to a real copy.
+
+    Returns how many files were linked.
+    """
+    src = media_root() / str(source_id)
+    if not src.is_dir():
+        return 0
+    dest = video_dir(dest_id)
+    linked = 0
+    for entry in sorted(src.iterdir()):
+        if not entry.is_file() or entry.suffix.lower() == ".part":
+            continue
+        target = dest / entry.name
+        if target.exists():
+            continue
+        try:
+            os.link(entry, target)
+        except OSError:
+            shutil.copy2(entry, target)
+        linked += 1
+    return linked
+
+
+def cloud_storage_available(video) -> bool:
+    """A cloud-stored unit is readable only while its drive link is live."""
+    if video.storage_backend is None:
+        return True
+    if not video.drive_file_id or video.drive_link_id is None:
+        return False
+    link = video.drive_link
+    return link is not None and bool(link.refresh_token)
 
 
 def iter_file(path: Path, start: int = 0, end: Optional[int] = None, chunk_size: int = 512 * 1024) -> Iterator[bytes]:

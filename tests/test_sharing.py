@@ -565,17 +565,17 @@ def test_invited_viewer_can_read_but_not_manage(client, auth_headers):
     from app.auth import hash_password
     from app.models import AdminUser
 
-    member_email = "member@test.local"
+    user_email = "user@test.local"
     with SessionLocal() as db:
         # The fixture preserves admin_users between tests, so clear any row a
         # previous run of this test left behind.
-        db.execute(AdminUser.__table__.delete().where(AdminUser.email == member_email))
+        db.execute(AdminUser.__table__.delete().where(AdminUser.email == user_email))
         db.commit()
         db.add(
             AdminUser(
-                email=member_email,
-                password_hash=hash_password("member-password"),
-                role="member",
+                email=user_email,
+                password_hash=hash_password("user-password"),
+                role="user",
                 is_active=True,
             )
         )
@@ -583,24 +583,24 @@ def test_invited_viewer_can_read_but_not_manage(client, auth_headers):
 
     login = client.post(
         "/api/v1/auth/login",
-        json={"email": member_email, "password": "member-password"},
+        json={"email": user_email, "password": "user-password"},
     )
     assert login.status_code == 200, login.text
-    member_headers = guest_headers(login.json()["token"])
+    user_headers = guest_headers(login.json()["token"])
 
     folder = make_folder(client, auth_headers, name="Curation queue", visibility="private")
     invited = client.post(
         f"/api/v1/folders/{folder['id']}/members",
-        json={"email": member_email, "role": "viewer"},
+        json={"email": user_email, "role": "viewer"},
         headers=auth_headers,
     )
     assert invited.status_code == 201, invited.text
     assert invited.json()["role"] == "viewer"
 
     # A viewer may open the folder and its cards...
-    assert client.get(f"/api/v1/folders/{folder['id']}", headers=member_headers).status_code == 200
+    assert client.get(f"/api/v1/folders/{folder['id']}", headers=user_headers).status_code == 200
     assert (
-        client.get(f"/api/v1/public/folders/{folder['id']}", headers=member_headers).status_code
+        client.get(f"/api/v1/public/folders/{folder['id']}", headers=user_headers).status_code
         == 200
     )
     # ...but may not rename it, move videos in, or export it.
@@ -608,16 +608,16 @@ def test_invited_viewer_can_read_but_not_manage(client, auth_headers):
         client.patch(
             f"/api/v1/folders/{folder['id']}",
             json={"name": "Renamed"},
-            headers=member_headers,
+            headers=user_headers,
         ).status_code
         == 403
     )
     assert (
-        client.get(f"/api/v1/public/folders/{folder['id']}/zip", headers=member_headers).status_code
+        client.get(f"/api/v1/public/folders/{folder['id']}/zip", headers=user_headers).status_code
         == 409  # readable, but the folder has no media yet
     )
 
-    # Promoting the same member to editor unlocks management.
+    # Promoting the same user to editor unlocks management.
     user_id = invited.json()["user_id"]
     promoted = client.patch(
         f"/api/v1/folders/{folder['id']}/members/{user_id}",
@@ -630,7 +630,7 @@ def test_invited_viewer_can_read_but_not_manage(client, auth_headers):
         client.patch(
             f"/api/v1/folders/{folder['id']}",
             json={"name": "Renamed"},
-            headers=member_headers,
+            headers=user_headers,
         ).status_code
         == 200
     )

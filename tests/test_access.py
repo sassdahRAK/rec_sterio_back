@@ -31,9 +31,9 @@ from app.models import AdminUser, Folder, FolderMember, Video
 
 @pytest.fixture
 def user():
-    """A dataset member (not the bootstrap operator)."""
+    """A dataset user (not the bootstrap operator)."""
     with SessionLocal() as db:
-        account = AdminUser(email=f"member-{uuid4().hex[:8]}@test.local", role="member")
+        account = AdminUser(email=f"user-{uuid4().hex[:8]}@test.local", role="user")
         db.add(account)
         db.commit()
         db.refresh(account)
@@ -60,7 +60,7 @@ def _folder(name="Folder", visibility="private", parent=None, owner_id=None):
         return folder.id
 
 
-def _video(folder_id=None, created_by="admin:admin@test.local"):
+def _video(folder_id=None, created_by="super_admin:admin@test.local"):
     with SessionLocal() as db:
         video = Video(
             source_url="upload://access-test.mp4",
@@ -104,17 +104,17 @@ def test_owner_is_an_editor_on_their_folder(user):
     fid = _folder(owner_id=user.id)
     with SessionLocal() as db:
         folder = _as(db, Folder, fid)
-        principal = Principal(f"member:{user.email}", "member", user.email)
+        principal = Principal(f"user:{user.email}", "user", user.email)
         assert role_on_folder(db, folder, principal) == "editor"
 
 
-def test_member_gets_exactly_the_role_they_were_granted(user):
+def test_user_gets_exactly_the_role_they_were_granted(user):
     fid = _folder()
     with SessionLocal() as db:
         folder = _as(db, Folder, fid)
         db.add(FolderMember(folder_id=fid, user_id=user.id, role="commenter"))
         db.commit()
-        principal = Principal(f"member:{user.email}", "member", user.email)
+        principal = Principal(f"user:{user.email}", "user", user.email)
         assert role_on_folder(db, folder, principal) == "commenter"
 
 
@@ -137,13 +137,13 @@ def test_private_folder_is_invisible_to_an_anonymous_visitor():
 
 
 def test_access_inherits_down_the_folder_tree(user):
-    """A member of a parent folder may read its sub-folders (#6)."""
+    """A user given a role on a parent folder may read its sub-folders (#6)."""
     parent = _folder(name="Parent")
     child = _folder(name="Child", parent=parent)
     with SessionLocal() as db:
         db.add(FolderMember(folder_id=parent, user_id=user.id, role="viewer"))
         db.commit()
-        principal = Principal(f"member:{user.email}", "member", user.email)
+        principal = Principal(f"user:{user.email}", "user", user.email)
         assert role_on_folder(db, _as(db, Folder, child), principal) == "viewer"
 
 
@@ -162,7 +162,7 @@ def test_a_private_child_is_not_exposed_by_a_sibling(user):
     with SessionLocal() as db:
         db.add(FolderMember(folder_id=parent, user_id=user.id, role="viewer"))
         db.commit()
-        principal = Principal(f"member:{user.email}", "member", user.email)
+        principal = Principal(f"user:{user.email}", "user", user.email)
         assert role_on_folder(db, _as(db, Folder, hidden), principal) == "viewer"
         # A stranger with no membership still cannot see it.
         assert role_on_folder(db, _as(db, Folder, hidden), Principal("guest:x", "guest")) is None
@@ -224,10 +224,10 @@ def test_a_scoped_editor_token_outranks_a_public_viewer():
 
 
 def test_the_ingesting_account_keeps_access_to_its_own_video(user):
-    """A member who filed a video can still see it even outside any folder."""
-    vid = _video(folder_id=None, created_by=f"member:{user.email}")
+    """A user who filed a video can still see it even outside any folder."""
+    vid = _video(folder_id=None, created_by=f"user:{user.email}")
     with SessionLocal() as db:
-        principal = Principal(f"member:{user.email}", "member", user.email)
+        principal = Principal(f"user:{user.email}", "user", user.email)
         assert video_role(db, _as(db, Video, vid), principal) == "editor"
 
 
@@ -237,14 +237,14 @@ def test_a_video_inherits_its_folder_role(user):
     with SessionLocal() as db:
         db.add(FolderMember(folder_id=fid, user_id=user.id, role="commenter"))
         db.commit()
-        principal = Principal(f"member:{user.email}", "member", user.email)
+        principal = Principal(f"user:{user.email}", "user", user.email)
         assert video_role(db, _as(db, Video, vid), principal) == "commenter"
 
 
 def test_an_unfiled_video_is_private_to_its_creator():
-    vid = _video(folder_id=None, created_by="member:someone@else.test")
+    vid = _video(folder_id=None, created_by="user:someone@else.test")
     with SessionLocal() as db:
-        stranger = Principal("member:me@test.local", "member", "me@test.local")
+        stranger = Principal("user:me@test.local", "user", "me@test.local")
         assert video_role(db, _as(db, Video, vid), stranger) is None
 
 
@@ -286,7 +286,7 @@ def test_require_comment_rejects_a_viewer_but_accepts_a_commenter(user):
         with pytest.raises(AppError):
             require_comment(db, _as(db, Folder, fid), viewer)
 
-        commenter = Principal(f"member:{user.email}", "member", user.email)
+        commenter = Principal(f"user:{user.email}", "user", user.email)
         assert require_comment(db, _as(db, Folder, fid), commenter) == "commenter"
 
 
@@ -296,7 +296,7 @@ def test_require_video_enforces_the_needed_role(user):
     with SessionLocal() as db:
         db.add(FolderMember(folder_id=fid, user_id=user.id, role="viewer"))
         db.commit()
-        principal = Principal(f"member:{user.email}", "member", user.email)
+        principal = Principal(f"user:{user.email}", "user", user.email)
         assert require_video(db, _as(db, Video, vid), principal, "viewer") == "viewer"
         with pytest.raises(AppError) as denied:
             require_video(db, _as(db, Video, vid), principal, "commenter")
@@ -305,9 +305,9 @@ def test_require_video_enforces_the_needed_role(user):
 
 
 def test_require_video_denies_a_stranger_outright():
-    vid = _video(folder_id=None, created_by="member:someone@else.test")
+    vid = _video(folder_id=None, created_by="user:someone@else.test")
     with SessionLocal() as db:
-        stranger = Principal("member:me@test.local", "member", "me@test.local")
+        stranger = Principal("user:me@test.local", "user", "me@test.local")
         with pytest.raises(AppError) as denied:
             require_video(db, _as(db, Video, vid), stranger)
         assert denied.value.status_code == 403
@@ -323,18 +323,18 @@ def test_visible_folders_hides_private_folders_from_strangers(user):
     with SessionLocal() as db:
         db.add(FolderMember(folder_id=mine, user_id=user.id, role="viewer"))
         db.commit()
-        principal = Principal(f"member:{user.email}", "member", user.email)
+        principal = Principal(f"user:{user.email}", "user", user.email)
         visible = visible_folders(db, principal)
         names = {db.get(Folder, fid).name for fid in visible}
         assert names == {"Mine", "Everyone"}
 
 
-def test_visible_folders_includes_a_member_role_for_the_caller(user):
+def test_visible_folders_includes_a_folder_role_for_the_caller(user):
     mine = _folder(name="Mine")
     with SessionLocal() as db:
         db.add(FolderMember(folder_id=mine, user_id=user.id, role="commenter"))
         db.commit()
-        principal = Principal(f"member:{user.email}", "member", user.email)
+        principal = Principal(f"user:{user.email}", "user", user.email)
         assert visible_folders(db, principal)[mine] == "commenter"
 
 

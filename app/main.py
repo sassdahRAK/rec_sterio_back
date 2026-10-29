@@ -12,6 +12,8 @@ from app.db import SessionLocal, init_db
 from app.errors import register_exception_handlers
 from app.routers import (
     auth,
+    bot_users,
+    cloud,
     folders,
     health,
     jobs,
@@ -21,6 +23,7 @@ from app.routers import (
     shares,
     stats,
     transcripts,
+    users,
     videos,
 )
 
@@ -78,9 +81,12 @@ app.include_router(transcripts.router, prefix=API_PREFIX)
 app.include_router(merges.router, prefix=API_PREFIX)
 app.include_router(jobs.router, prefix=API_PREFIX)
 app.include_router(folders.router, prefix=API_PREFIX)
+app.include_router(users.router, prefix=API_PREFIX)
 app.include_router(shares.router, prefix=API_PREFIX)
 app.include_router(passcodes.router, prefix=API_PREFIX)
 app.include_router(public.router, prefix=API_PREFIX)
+app.include_router(bot_users.router, prefix=API_PREFIX)
+app.include_router(cloud.router, prefix=API_PREFIX)
 
 
 @app.get("/")

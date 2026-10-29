@@ -37,11 +37,14 @@ from app.schemas import (
     ShareRedeem,
 )
 from app.services import storage, zip_export
+from app.services.storage import cloud_storage_available
 from app.services.zip_export import safe_name
 
 router = APIRouter(prefix="/public", tags=["public"])
 
 CARD_PREVIEW_CHARS = 240
+
+
 
 
 def _video_cards(db: Session, folder: Folder) -> list[DataCardOut]:
@@ -73,6 +76,8 @@ def _video_cards(db: Session, folder: Folder) -> list[DataCardOut]:
                 transcript_id=transcript.id if transcript is not None else None,
                 transcript_preview=preview,
                 audio_available=storage.audio_file(video.id).exists(),
+                storage_backend=video.storage_backend,
+                storage_available=cloud_storage_available(video),
                 media_url=f"/api/v1/videos/{video.id}/media",
                 audio_url=f"/api/v1/videos/{video.id}/audio",
                 transcript_url=f"/api/v1/videos/{video.id}/transcript",
@@ -221,7 +226,13 @@ def redeem_passcode_code(
     """Open a private folder with its passcode and receive a scoped token."""
     from app.routers.passcodes import redeem_passcode
 
-    folder = redeem_passcode(db, payload.folder_id, payload.code, payload.device_key)
+    folder = redeem_passcode(
+        db,
+        payload.code,
+        payload.device_key,
+        folder_id=payload.folder_id,
+        folder_name=payload.folder_name,
+    )
     # A passcode opens the door read-only: `access` records how it was opened,
     # while the granted *role* must stay in the viewer/commenter/editor scale.
     token, expires = issue_folder_token(folder.id, "viewer")

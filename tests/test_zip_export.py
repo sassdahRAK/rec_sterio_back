@@ -47,7 +47,7 @@ def _video(folder_id=None, title="Clip", with_media=False, with_audio=False):
             platform="direct",
             title=title,
             folder_id=folder_id,
-            created_by="admin:admin@test.local",
+            created_by="super_admin:admin@test.local",
         )
         db.add(video)
         db.commit()

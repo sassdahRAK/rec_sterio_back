@@ -1,10 +1,12 @@
-"""Videos: create, dedupe, listing, SSRF guard, detail, patch, delete."""
+"""Videos: create, dedupe, listing, SSRF guard, detail, patch, delete, audio."""
 from __future__ import annotations
 
 from sqlalchemy import select
 
 from app.db import SessionLocal
 from app.models import Job, Video
+from app.services import storage
+from tests.helpers import upload_video
 
 URL = "https://www.youtube.com/watch?v=recsterio-test-001"
 
@@ -20,7 +22,7 @@ def test_create_video_returns_201_and_queues_download(client, auth_headers):
     assert body["status"] == "pending"
     assert body["source_url"] == URL
     assert body["platform"] == "youtube"
-    assert body["created_by"] == "admin:admin@test.local"
+    assert body["created_by"] == "super_admin:admin@test.local"
 
     jobs = client.get("/api/v1/jobs", headers=auth_headers).json()
     kinds = [j["kind"] for j in jobs["items"]]
@@ -37,6 +39,81 @@ def test_video_appears_in_list(client, auth_headers):
     assert body["items"][0]["source_url"] == URL
     assert body["page"] == 1
     assert body["page_size"] == 20
+
+
+def test_the_source_url_lock_makes_two_transactions_take_turns():
+    """The mechanism behind the de-duplication, proven deterministically.
+
+    The HTTP-level race below is too narrow to hit reliably in-process, so this
+    pins the lock itself: a second transaction cannot obtain the same URL's
+    lock until the first one commits.
+    """
+    import threading
+    import time
+
+    from app.routers.videos import _lock_on_source_url
+
+    order: list[str] = []
+    waited: list[float] = []
+
+    def first() -> None:
+        with SessionLocal() as db:
+            _lock_on_source_url(db, URL)
+            order.append("first-locked")
+            time.sleep(0.4)  # stand in for the SELECT + INSERT the lock covers
+            db.commit()
+
+    def second() -> None:
+        time.sleep(0.1)  # start while the first still holds it
+        with SessionLocal() as db:
+            started = time.monotonic()
+            _lock_on_source_url(db, URL)
+            waited.append(time.monotonic() - started)
+            order.append("second-locked")
+            db.commit()
+
+    threads = [threading.Thread(target=first), threading.Thread(target=second)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    # The second acquisition must have BLOCKED until the first committed.
+    # Checking only the append order would pass without the lock too, since the
+    # first thread appends before it sleeps.
+    assert waited and waited[0] >= 0.2, f"second transaction did not wait: {waited}"
+    assert order == ["first-locked", "second-locked"]
+
+
+def test_simultaneous_creates_of_one_url_still_produce_one_video(client, auth_headers):
+    """The double-tapped link button: two requests, one row.
+
+    The de-duplication is a read followed by a write, so without the advisory
+    lock both requests find nothing and both insert — and the worker then
+    downloads and transcribes the same media twice. Threads here stand in for
+    the two concurrent bot updates.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [
+            pool.submit(
+                client.post,
+                "/api/v1/videos",
+                json={"source_url": URL},
+                headers=auth_headers,
+            )
+            for _ in range(2)
+        ]
+        results = [f.result() for f in futures]
+
+    codes = sorted(r.status_code for r in results)
+    assert codes == [201, 409], [r.text for r in results]
+    with SessionLocal() as db:
+        rows = db.execute(select(Video).where(Video.source_url == URL)).scalars().all()
+        assert len(rows) == 1
+        # And exactly one download job, not two.
+        assert len(db.execute(select(Job)).scalars().all()) == 1
 
 
 def test_duplicate_source_url_does_not_create_a_second_video(client, auth_headers):
@@ -101,6 +178,22 @@ def test_get_video_detail_includes_transcripts_and_jobs(client, auth_headers):
     assert body["jobs"][0]["kind"] == "download"
 
 
+def test_video_detail_masks_local_path_to_a_filename(client, auth_headers):
+    """The stored local_path is a server path; the API must not leak it.
+
+    Only an upload (or a finished download) sets local_path, so the test goes
+    through the upload flow and then reads the detail endpoint.
+    """
+    video = upload_video(client, auth_headers)
+    resp = client.get(f"/api/v1/videos/{video['id']}", headers=auth_headers)
+    assert resp.status_code == 200
+    local_path = resp.json()["local_path"]
+    # A bare filename: no directory components, same extension as the upload.
+    assert local_path
+    assert "/" not in local_path
+    assert local_path.endswith(".mp4")
+
+
 def test_patch_video_updates_fields(client, auth_headers):
     video = client.post("/api/v1/videos", json={"source_url": URL}, headers=auth_headers).json()
     resp = client.patch(
@@ -137,6 +230,23 @@ def test_unknown_video_is_404_envelope(client, auth_headers):
 
 def test_retry_reenqueues_download_job(client, auth_headers):
     video = client.post("/api/v1/videos", json={"source_url": URL}, headers=auth_headers).json()
+    # Creating the video already queued a download. Retrying a second time
+    # would download the same file twice, so the API refuses — this is the
+    # double-tapped Retry button.
+    blocked = client.post(f"/api/v1/videos/{video['id']}/retry", headers=auth_headers)
+    assert blocked.status_code == 409, blocked.text
+    assert blocked.json()["error"]["code"] == "job_in_progress"
+    assert blocked.json()["error"]["details"][0]["status"] == "queued"
+    # Exactly one job exists: the refused attempt enqueued nothing.
+    with SessionLocal() as db:
+        assert len(db.execute(select(Job)).scalars().all()) == 1
+
+    # Once the queued job has finished (here: failed), a retry is legitimate.
+    with SessionLocal() as db:
+        job = db.execute(select(Job)).scalars().one()
+        job.status = "failed"
+        db.commit()
+
     resp = client.post(f"/api/v1/videos/{video['id']}/retry", headers=auth_headers)
     assert resp.status_code == 202
     assert resp.json()["kind"] == "download"
@@ -201,3 +311,64 @@ def test_file_size_accepts_a_multi_gigabyte_download(client, auth_headers):
         assert stored == seven_gb
         db.delete(video)
         db.commit()
+
+
+# ------------------------------------------------------------------ audio
+
+
+def test_audio_download_serves_the_wav_by_default(client, auth_headers):
+    """Portal data cards link here without a format param; the wav is the default."""
+    video = client.post("/api/v1/videos", json={"source_url": URL}, headers=auth_headers).json()
+    payload = b"RIFF" + b"\x00" * 128
+    storage.audio_file(video["id"]).write_bytes(payload)
+
+    resp = client.get(f"/api/v1/videos/{video['id']}/audio", headers=auth_headers)
+    assert resp.status_code == 200, resp.text
+    assert resp.headers["content-type"].startswith("audio/wav")
+    assert (
+        resp.headers["content-disposition"]
+        == f'attachment; filename="{video["id"]}-audio.wav"'
+    )
+    assert resp.content == payload
+
+
+def test_audio_download_serves_the_mp3_listening_copy(client, auth_headers):
+    video = client.post("/api/v1/videos", json={"source_url": URL}, headers=auth_headers).json()
+    payload = b"ID3" + b"\x00" * 128
+    storage.audio_mp3_file(video["id"]).write_bytes(payload)
+
+    resp = client.get(
+        f"/api/v1/videos/{video['id']}/audio", params={"format": "mp3"}, headers=auth_headers
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.headers["content-type"].startswith("audio/mpeg")
+    assert (
+        resp.headers["content-disposition"]
+        == f'attachment; filename="{video["id"]}-audio.mp3"'
+    )
+    assert resp.content == payload
+
+
+def test_audio_download_rejects_an_unknown_format(client, auth_headers):
+    video = client.post("/api/v1/videos", json={"source_url": URL}, headers=auth_headers).json()
+    storage.audio_file(video["id"]).write_bytes(b"RIFF" + b"\x00" * 32)
+
+    resp = client.get(
+        f"/api/v1/videos/{video['id']}/audio", params={"format": "flac"}, headers=auth_headers
+    )
+    assert resp.status_code == 422, resp.text
+    body = resp.json()
+    assert body["error"]["code"] == "validation_failed"
+    assert body["error"]["message"] == "format must be 'wav' or 'mp3'."
+
+
+def test_audio_download_mp3_404_when_not_extracted(client, auth_headers):
+    """The wav can exist without the mp3: extraction of the copy is best effort."""
+    video = client.post("/api/v1/videos", json={"source_url": URL}, headers=auth_headers).json()
+    storage.audio_file(video["id"]).write_bytes(b"RIFF" + b"\x00" * 32)
+
+    resp = client.get(
+        f"/api/v1/videos/{video['id']}/audio", params={"format": "mp3"}, headers=auth_headers
+    )
+    assert resp.status_code == 404, resp.text
+    assert resp.json()["error"]["message"] == "MP3 has not been extracted for this video."

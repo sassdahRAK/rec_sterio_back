@@ -300,6 +300,60 @@ def extract_audio(
     return out_path
 
 
+def extract_mp3(
+    media_path: Path,
+    out_path: Path,
+    timeout_seconds: int | None = None,
+) -> Path:
+    """Extract an .mp3 listening copy from a media file (ffmpeg, with timeout).
+
+    This is the copy humans download to *listen*: VBR ~128k, taken from the
+    original media so it keeps real quality. The 16 kHz wav is ASR-only.
+    """
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg is not installed on the server.")
+
+    timeout = timeout_seconds or settings.ffmpeg_timeout_seconds
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    # Work in a temp dir first so a failed run never leaves a truncated mp3 behind.
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_out = Path(tmpdir) / "audio.mp3"
+        cmd = [
+            ffmpeg,
+            "-nostdin",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(media_path),
+            "-vn",
+            "-codec:a",
+            "libmp3lame",
+            "-q:a",
+            "4",
+            str(tmp_out),
+        ]
+        try:
+            proc = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"ffmpeg timed out after {timeout}s while extracting the mp3."
+            ) from exc
+        if proc.returncode != 0 or not tmp_out.exists():
+            stderr = (proc.stderr or b"").decode("utf-8", "replace").strip()
+            raise RuntimeError(f"ffmpeg failed to extract the mp3: {stderr[:400]}")
+        out_path.write_bytes(tmp_out.read_bytes())
+    return out_path
+
+
 def audio_duration(audio_path: Path) -> Optional[float]:
     """Duration of a wav file, read from the header (no ffprobe needed)."""
     try:

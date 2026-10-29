@@ -7,8 +7,10 @@ from pathlib import Path
 from app.db import SessionLocal
 from app.models import Job, Transcript, Video
 from app.services import asr as asr_service
+from app.services import downloader
 from app.services import gemini as gemini_service
 from app.services import storage
+from app.services.downloader import DownloadResult
 from app.worker import queue
 from app.worker.runner import (
     handle_extract_audio,
@@ -219,3 +221,106 @@ def test_extract_with_a_transcribe_chain_moves_to_transcribing(monkeypatch):
         )
         assert nxt is not None
         assert nxt.status == "queued"
+
+
+def test_extract_job_also_calls_the_mp3_extractor(monkeypatch):
+    """The extract job must produce the .mp3 listening copy, not just the wav."""
+    video_id = _make_video_with_audio()
+    captured = {}
+
+    def fake_extract_mp3(media_path, out_path, timeout_seconds=None):
+        captured["media"] = Path(media_path)
+        captured["out"] = Path(out_path)
+        out_path.write_bytes(b"ID3" + b"\x00" * 300)
+        return out_path
+
+    monkeypatch.setattr(asr_service, "extract_mp3", fake_extract_mp3)
+    with SessionLocal() as db:
+        job = queue.enqueue(db, "extract_audio", video_id=video_id, payload={"chain": []})
+        db.commit()
+        job_id = str(job.id)
+
+    with SessionLocal() as db:
+        job = db.get(Job, job_id)
+        run_job(db, job)
+        assert job.status == "succeeded", job.last_error
+
+    assert captured["media"].name == "media.mp4"
+    assert captured["out"] == storage.audio_mp3_file(video_id)
+    assert storage.audio_mp3_file(video_id).exists()
+
+
+def test_extract_job_survives_an_mp3_extraction_failure(monkeypatch):
+    """The wav is what ASR needs; a failed mp3 must not kill the job or chain."""
+    video_id = _make_video_with_audio()
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("ffmpeg exploded")
+
+    monkeypatch.setattr(asr_service, "extract_mp3", _boom)
+    with SessionLocal() as db:
+        job = queue.enqueue(
+            db, "extract_audio", video_id=video_id, payload={"chain": ["transcribe"]}
+        )
+        db.commit()
+        job_id = str(job.id)
+
+    with SessionLocal() as db:
+        job = db.get(Job, job_id)
+        run_job(db, job)
+        assert job.status == "succeeded", job.last_error
+
+    with SessionLocal() as db:
+        video = db.get(Video, video_id)
+        assert video.status == "transcribing"
+        nxt = (
+            db.query(Job)
+            .filter(Job.video_id == video_id, Job.kind == "transcribe")
+            .one_or_none()
+        )
+        assert nxt is not None
+        assert nxt.status == "queued"
+    assert not storage.audio_mp3_file(video_id).exists()
+
+
+def test_handle_download_passes_the_per_user_cookiefile(monkeypatch, tmp_path):
+    """A video ingested by a Telegram user downloads under their own cookies;
+    any other actor ("system", the bot itself) uses the server defaults."""
+    captured = {}
+
+    def fake_download(source_url, video_id, on_progress=None, cookiefile=None):
+        captured["cookiefile"] = cookiefile
+        return DownloadResult(path=tmp_path / "media.mp4")
+
+    monkeypatch.setattr(downloader, "download", fake_download)
+    cookie_path = tmp_path / "424242.txt"
+    cookie_path.write_text("# Netscape HTTP Cookie File\n")
+    monkeypatch.setattr(storage, "cookie_file", lambda uid: tmp_path / f"{uid}.txt")
+
+    def _enqueue_download(created_by: str) -> str:
+        with SessionLocal() as db:
+            video = Video(
+                source_url=URL, platform="youtube", status="pending", created_by=created_by
+            )
+            db.add(video)
+            db.commit()
+            db.refresh(video)
+            job = queue.enqueue(db, "download", video_id=video.id, payload={"chain": []})
+            db.commit()
+            return str(job.id)
+
+    job_id = _enqueue_download("telegram:424242")
+    with SessionLocal() as db:
+        job = db.get(Job, job_id)
+        run_job(db, job)
+        assert job.status == "succeeded", job.last_error
+    assert captured["cookiefile"] == str(cookie_path)
+
+    # An actor without a numeric Telegram suffix is not a user session.
+    captured.clear()
+    job_id = _enqueue_download("system")
+    with SessionLocal() as db:
+        job = db.get(Job, job_id)
+        run_job(db, job)
+        assert job.status == "succeeded", job.last_error
+    assert captured["cookiefile"] is None

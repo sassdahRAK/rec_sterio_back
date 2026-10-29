@@ -37,8 +37,8 @@ def make_folder(client, headers, name="Dataset", visibility="private", parent_id
     return resp.json()
 
 
-def make_member(email="member@test.local", password="member-password"):
-    """Create a member account and return bearer headers for it."""
+def make_user(email="user@test.local", password="user-password"):
+    """Create a user account and return bearer headers for it."""
     with SessionLocal() as db:
         user = db.execute(
             select(AdminUser).where(AdminUser.email == email)
@@ -47,13 +47,13 @@ def make_member(email="member@test.local", password="member-password"):
             user = AdminUser(
                 email=email,
                 password_hash=hash_password(password),
-                role="member",
+                role="user",
             )
             db.add(user)
             db.commit()
             db.refresh(user)
         user_id = str(user.id)
-    token, _ = create_access_token(email, role="member")
+    token, _ = create_access_token(email, role="user")
     return {"Authorization": f"Bearer {token}"}, user_id
 
 
@@ -67,7 +67,7 @@ def make_video(folder_id, title="Clip", cleaned=False, with_files=True):
             status="transcribed",
             progress=100,
             folder_id=folder_id,
-            created_by=f"admin:{ADMIN_EMAIL}",
+            created_by=f"super_admin:{ADMIN_EMAIL}",
         )
         db.add(video)
         db.flush()
@@ -127,8 +127,8 @@ def test_subfolders_nest_and_count_their_videos(client, auth_headers):
     assert detail["children"][0]["video_count"] == 1
 
 
-def test_member_cannot_create_a_public_folder(client, auth_headers):
-    headers, _ = make_member()
+def test_user_cannot_create_a_public_folder(client, auth_headers):
+    headers, _ = make_user()
     resp = client.post(
         f"{API}/folders", json={"name": "Nope", "visibility": "public"}, headers=headers
     )
@@ -167,17 +167,17 @@ def test_anonymous_without_token_can_read_public_folder(client, auth_headers):
 # ------------------------------------------------------------------- roles
 
 
-def test_member_roles_gate_editing(client, auth_headers):
+def test_invite_roles_gate_editing(client, auth_headers):
     folder = make_folder(client, auth_headers, "Shared", "private")
     video_id = make_video(folder["id"])
-    headers, user_id = make_member()
+    headers, user_id = make_user()
 
     # Not invited yet: the folder is invisible, not merely read-only.
     assert client.get(f"{API}/folders/{folder['id']}", headers=headers).status_code == 404
 
     invited = client.post(
         f"{API}/folders/{folder['id']}/members",
-        json={"email": "member@test.local", "role": "viewer"},
+        json={"email": "user@test.local", "role": "viewer"},
         headers=auth_headers,
     )
     assert invited.status_code == 201, invited.text
@@ -441,7 +441,7 @@ def test_unfiled_video_is_console_only(client, auth_headers):
             source_url="upload://unfiled.mp4",
             platform="direct",
             status="transcribed",
-            created_by=f"admin:{ADMIN_EMAIL}",
+            created_by=f"super_admin:{ADMIN_EMAIL}",
         )
         db.add(video)
         db.commit()
@@ -498,7 +498,7 @@ def test_me_reports_the_caller_and_scopes(client, auth_headers):
     me = client.get(f"{API}/auth/me", headers=auth_headers)
     assert me.status_code == 200
     assert me.json()["email"] == ADMIN_EMAIL
-    assert me.json()["role"] == "admin"
+    assert me.json()["role"] == "super_admin"
 
     guest = client.post(f"{API}/auth/guest").json()
     assert guest["role"] == "guest"
@@ -536,3 +536,130 @@ def test_public_config_advertises_google_only_when_configured(client):
         assert body["google_client_id"] == "abc.apps.googleusercontent.com"
     finally:
         settings.google_client_id = original
+
+
+# --------------------------------------------- passcodes without a folder list
+
+
+def test_passcode_opens_the_folder_when_only_the_name_is_typed(client, auth_headers):
+    """A visitor who knows the code and the folder's name needs nothing else.
+
+    The portal never lists folders — a public list would disclose how many
+    folders exist and what they are called — so the name is the only way in.
+    """
+    folder = make_folder(client, auth_headers, "Team recordings", "private")
+    client.post(
+        f"{API}/folders/{folder['id']}/passcodes",
+        json={"code": "name-open"},
+        headers=auth_headers,
+    )
+
+    opened = client.post(
+        f"{API}/public/passcodes/redeem",
+        json={"folder_name": "team RECORDINGS", "code": "name-open"},
+    )
+    assert opened.status_code == 200, opened.text
+    assert opened.json()["folder_id"] == folder["id"]
+
+
+def test_passcode_alone_opens_the_folder(client, auth_headers):
+    folder = make_folder(client, auth_headers, "Code only", "private")
+    client.post(
+        f"{API}/folders/{folder['id']}/passcodes",
+        json={"code": "code-only"},
+        headers=auth_headers,
+    )
+    opened = client.post(
+        f"{API}/public/passcodes/redeem", json={"code": "code-only"}
+    )
+    assert opened.status_code == 200, opened.text
+    assert opened.json()["folder_id"] == folder["id"]
+
+
+def test_wrong_name_with_a_valid_code_is_indistinguishable_from_a_wrong_code(
+    client, auth_headers
+):
+    folder = make_folder(client, auth_headers, "Real folder", "private")
+    client.post(
+        f"{API}/folders/{folder['id']}/passcodes",
+        json={"code": "guarded"},
+        headers=auth_headers,
+    )
+    wrong_name = client.post(
+        f"{API}/public/passcodes/redeem",
+        json={"folder_name": "Some other folder", "code": "guarded"},
+    )
+    wrong_code = client.post(
+        f"{API}/public/passcodes/redeem",
+        json={"folder_name": "Real folder", "code": "nope"},
+    )
+    assert wrong_name.status_code == wrong_code.status_code == 401
+    assert wrong_name.json() == wrong_code.json()
+
+
+def test_a_code_shared_by_two_folders_asks_for_the_link(client, auth_headers):
+    first = make_folder(client, auth_headers, "Alpha", "private")
+    second = make_folder(client, auth_headers, "Beta", "private")
+    for folder in (first, second):
+        client.post(
+            f"{API}/folders/{folder['id']}/passcodes",
+            json={"code": "twin-code"},
+            headers=auth_headers,
+        )
+
+    ambiguous = client.post(
+        f"{API}/public/passcodes/redeem", json={"code": "twin-code"}
+    )
+    assert ambiguous.status_code == 422
+    assert ambiguous.json()["error"]["code"] == "ambiguous_folder"
+    # Naming one of them resolves it.
+    named = client.post(
+        f"{API}/public/passcodes/redeem",
+        json={"folder_name": "Beta", "code": "twin-code"},
+    )
+    assert named.status_code == 200
+    assert named.json()["folder_id"] == second["id"]
+
+
+# ------------------------------------------------- moving folders around
+
+
+def test_folder_can_be_nested_and_lifted_back_to_the_top(client, auth_headers):
+    parent = make_folder(client, auth_headers, "Parent", "private")
+    child = make_folder(client, auth_headers, "Child", "private")
+
+    nested = client.patch(
+        f"{API}/folders/{child['id']}", json={"parent_id": parent["id"]}, headers=auth_headers
+    )
+    assert nested.status_code == 200, nested.text
+    assert nested.json()["parent_id"] == parent["id"]
+
+    lifted = client.patch(
+        f"{API}/folders/{child['id']}", json={"parent_id": None}, headers=auth_headers
+    )
+    assert lifted.status_code == 200, lifted.text
+    assert lifted.json()["parent_id"] is None
+
+
+def test_a_folder_cannot_be_moved_into_its_own_subtree(client, auth_headers):
+    """A cycle would detach the whole subtree from every listing.
+
+    The console's drag-and-drop already refuses these targets, but the rule has
+    to hold at the API too — a stale client must not be able to wedge the tree.
+    """
+    root = make_folder(client, auth_headers, "Root", "private")
+    child = make_folder(client, auth_headers, "Child", "private", parent_id=root["id"])
+    grandchild = make_folder(client, auth_headers, "Grandchild", "private", parent_id=child["id"])
+
+    for target in (root["id"], child["id"], grandchild["id"]):
+        resp = client.patch(
+            f"{API}/folders/{root['id']}", json={"parent_id": target}, headers=auth_headers
+        )
+        assert resp.status_code == 422, f"moving into {target} should be rejected"
+        assert resp.json()["error"]["code"] == "validation_failed"
+
+    # The tree is still intact after the refusals.
+    listing = client.get(f"{API}/folders", headers=auth_headers).json()["items"]
+    root_row = next(item for item in listing if item["id"] == root["id"])
+    assert [c["id"] for c in root_row["children"]] == [child["id"]]
+    assert [g["id"] for g in root_row["children"][0]["children"]] == [grandchild["id"]]

@@ -13,7 +13,7 @@ import pytest
 from app.db import SessionLocal
 from app.models import ShareLink
 from app.routers.shares import find_active_share, folder_for_share, share_url
-from tests.helpers import ensure_member, make_folder, member_headers
+from tests.helpers import ensure_user, make_folder, user_headers
 
 
 def _share(client, headers, folder_id, **payload):
@@ -86,13 +86,13 @@ def test_creating_a_share_requires_authentication(client):
 
 def test_creating_a_share_requires_manage_on_the_folder(client, auth_headers):
     folder = make_folder(client, auth_headers, name="Dataset")
-    email = ensure_member()
+    email = ensure_user()
     client.post(
         f"/api/v1/folders/{folder['id']}/members",
         json={"email": email, "role": "viewer"},
         headers=auth_headers,
     )
-    resp = _share(client, member_headers(email), folder["id"])
+    resp = _share(client, user_headers(email), folder["id"])
     assert resp.status_code == 403
 
 
@@ -120,14 +120,14 @@ def test_list_shares_returns_them_newest_first(client, auth_headers):
 
 def test_listing_shares_requires_manage(client, auth_headers):
     folder = make_folder(client, auth_headers, name="Dataset")
-    email = ensure_member()
+    email = ensure_user()
     client.post(
         f"/api/v1/folders/{folder['id']}/members",
         json={"email": email, "role": "viewer"},
         headers=auth_headers,
     )
     resp = client.get(
-        f"/api/v1/folders/{folder['id']}/shares", headers=member_headers(email)
+        f"/api/v1/folders/{folder['id']}/shares", headers=user_headers(email)
     )
     assert resp.status_code == 403
 
@@ -177,13 +177,13 @@ def test_a_revoked_share_cannot_open_its_folder(client, auth_headers):
 def test_revoking_requires_manage_on_the_share_folder(client, auth_headers):
     folder = make_folder(client, auth_headers, name="Dataset")
     share = _make_share(client, auth_headers, folder["id"])
-    email = ensure_member()
+    email = ensure_user()
     client.post(
         f"/api/v1/folders/{folder['id']}/members",
         json={"email": email, "role": "viewer"},
         headers=auth_headers,
     )
-    resp = client.delete(f"/api/v1/shares/{share['id']}", headers=member_headers(email))
+    resp = client.delete(f"/api/v1/shares/{share['id']}", headers=user_headers(email))
     assert resp.status_code == 403
 
 

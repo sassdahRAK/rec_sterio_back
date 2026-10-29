@@ -13,7 +13,9 @@ python-multipart>=0.0.9
 httpx>=0.27
 
 # video download (feature 1)
-yt-dlp>=2024.8
+yt-dlp[default]>=2024.8
+# YouTube's anti-bot challenge needs the EJS solver scripts + a JS runtime (node/bun/deno) on the host; without them YouTube serves no media formats.
+yt-dlp-ejs>=0.8
 # TLS impersonation (what yt-dlp's "curl-cffi" extra pulls in) so TikTok /
 # Facebook see a real browser fingerprint. Keep the range inside what the
 # installed yt-dlp declares for that extra (>=0.5.10, <0.17).

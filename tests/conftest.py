@@ -44,6 +44,7 @@ def _ensure_test_database() -> None:
 _ensure_test_database()
 
 _MEDIA_ROOT = tempfile.mkdtemp(prefix="recsterio-test-media-")
+_COOKIES_ROOT = tempfile.mkdtemp(prefix="recsterio-test-cookies-")
 
 # The environment must be configured *before* app.config is imported.
 os.environ["DATABASE_URL"] = _TEST_DSN
@@ -52,11 +53,16 @@ os.environ["ADMIN_EMAIL"] = ADMIN_EMAIL
 os.environ["ADMIN_PASSWORD"] = ADMIN_PASSWORD
 os.environ["BOT_API_TOKEN"] = BOT_TOKEN
 os.environ["MEDIA_ROOT"] = _MEDIA_ROOT
+os.environ["COOKIES_ROOT"] = _COOKIES_ROOT
 os.environ["WORKER_AUTOSTART"] = "false"
 os.environ["WORKER_POLL_SECONDS"] = "0.2"
 os.environ["GEMINI_API_KEY"] = ""
 os.environ["LOGIN_RATE_LIMIT"] = "10000"
 os.environ["VIDEO_CREATE_RATE_LIMIT"] = "10000"
+# The developer's real .env (loaded by pydantic-settings) must not leak into
+# the suite: a configured bot username changes link-code responses, the same
+# way a real ADMIN_PASSWORD would change every login test.
+os.environ["TELEGRAM_BOT_USERNAME"] = ""
 
 from fastapi.testclient import TestClient  # noqa: E402
 from sqlalchemy import text  # noqa: E402
@@ -75,6 +81,7 @@ def client():
     with TestClient(app) as test_client:
         yield test_client
     shutil.rmtree(_MEDIA_ROOT, ignore_errors=True)
+    shutil.rmtree(_COOKIES_ROOT, ignore_errors=True)
 
 
 @pytest.fixture(autouse=True)
@@ -88,11 +95,16 @@ def clean_database(client):
         # Accounts a test created go first: they cascade into folders,
         # memberships, comments and passcode grants. The seeded bootstrap admin
         # is preserved, and any other account is removed so a test that invites
-        # "member@test.local" cannot collide with a previous run.
+        # "user@test.local" cannot collide with a previous run.
         conn.execute(
             text("delete from admin_users where email <> :keep"), {"keep": ADMIN_EMAIL}
         )
+        # The seeded admin survives the wipe above, so its Telegram link (and
+        # any outstanding link code) would too: reset both, or a test that
+        # linked the operator poisons the next one that asserts "unlinked".
+        conn.execute(text("update admin_users set telegram_user_id = null"))
         for table in (
+            "link_codes",
             "passcode_grants",
             "folder_passcodes",
             "share_links",
@@ -103,8 +115,12 @@ def clean_database(client):
             "videos",
             "transcripts",
             "folders",
+            "bot_users",
         ):
             conn.execute(text(f"delete from {table}"))
+    # The per-user cookies files live on disk, outside the database wipe.
+    for name in os.listdir(_COOKIES_ROOT):
+        os.unlink(os.path.join(_COOKIES_ROOT, name))
     yield
 
 

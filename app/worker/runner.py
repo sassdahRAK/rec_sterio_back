@@ -115,6 +115,17 @@ def _set_video(db: Session, video: Video, **values: Any) -> None:
     db.flush()
 
 
+def _cleanup_cloud_temp(video: Video, media: Path) -> None:
+    """Delete the temp local copy of a cloud-stored video after extraction."""
+    if video.storage_backend and media.name.endswith(".cloud-tmp"):
+        try:
+            media.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("could not remove cloud temp %s", media)
+        if video.local_path == str(media):
+            video.local_path = None
+
+
 def _ensure_audio(db: Session, video: Video) -> Path:
     """Make sure a 16 kHz mono wav exists for the video (idempotent)."""
     media = storage.find_media_file(video.id)
@@ -124,13 +135,42 @@ def _ensure_audio(db: Session, video: Video) -> Path:
         )
     audio = storage.audio_file(video.id)
     if audio.exists() and audio.stat().st_size > 44:
+        _cleanup_cloud_temp(video, media)
         return audio
     try:
         asr_service.extract_audio(media, audio)
     except RuntimeError as exc:
+        _cleanup_cloud_temp(video, media)
         raise PermanentJobError(f"Audio extraction failed: {exc}") from exc
+    # Best-effort mp3 BEFORE we clean up the cloud temp so the source file
+    # is still available for extraction.
+    _ensure_mp3(db, video, media=media)
+    _cleanup_cloud_temp(video, media)
     _set_video(db, video, status="transcribing")
     return audio
+
+
+def _ensure_mp3(db: Session, video: Video, media: Optional[Path] = None) -> None:
+    """Make sure an .mp3 listening copy exists for the video (best effort).
+
+    Unlike the wav, the mp3 is a convenience for humans, never an input the
+    pipeline needs: a missing media file or a failed extraction is only
+    logged, because killing the chain over it would cost ASR the wav.
+
+    Pass `media` directly to bypass `find_media_file` — useful when the caller
+    already holds the path and the cloud-tmp has not yet been deleted.
+    """
+    if media is None:
+        media = storage.find_media_file(video.id)
+    if media is None:
+        return
+    mp3 = storage.audio_mp3_file(video.id)
+    if mp3.exists() and mp3.stat().st_size > 200:
+        return
+    try:
+        asr_service.extract_mp3(media, mp3)
+    except Exception as exc:  # noqa: BLE001 - non-fatal by design
+        logger.warning("mp3 extraction failed for %s: %s", video.id, exc)
 
 
 # --------------------------------------------------------------------------
@@ -155,6 +195,18 @@ def handle_download(db: Session, job: Job) -> None:
     _set_video(db, video, status="downloading", progress=0, error=None)
     db.commit()
 
+    # A video ingested by a Telegram user ("telegram:<id>") downloads under
+    # that user's own cookies when they uploaded some; every other actor
+    # ("system", "admin:<email>", the bot's "telegram:bot") uses server
+    # defaults.
+    cookiefile = None
+    if video.created_by and video.created_by.startswith("telegram:"):
+        uid = video.created_by.split(":", 1)[1]
+        if uid.isdigit():
+            user_cookies = storage.cookie_file(int(uid))
+            if user_cookies.exists():
+                cookiefile = str(user_cookies)
+
     def _progress(percent: int) -> None:
         with SessionLocal() as pdb:
             row = pdb.get(Video, video.id)
@@ -163,7 +215,9 @@ def handle_download(db: Session, job: Job) -> None:
                 pdb.commit()
 
     try:
-        result = downloader.download(video.source_url, video.id, on_progress=_progress)
+        result = downloader.download(
+            video.source_url, video.id, on_progress=_progress, cookiefile=cookiefile
+        )
     except downloader.DownloadError as exc:
         raise PermanentJobError(str(exc)) from exc
 
@@ -199,6 +253,8 @@ def handle_extract_audio(db: Session, job: Job) -> None:
     if video is None:
         raise PermanentJobError("Video no longer exists.")
     audio = _ensure_audio(db, video)
+    # Best-effort listening copy; failures inside are logged, never fatal.
+    _ensure_mp3(db, video)
     # Only move to "transcribing" when a transcription job actually follows.
     # An extract-only request (upload with start_transcription=false) has an
     # empty chain, and setting "transcribing" would strand the video there

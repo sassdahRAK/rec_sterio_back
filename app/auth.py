@@ -1,4 +1,4 @@
-"""Authentication: admin JWT bearer tokens + Telegram bot service token."""
+"""Authentication: account JWT bearer tokens + Telegram bot service token."""
 from __future__ import annotations
 
 import logging
@@ -17,6 +17,7 @@ from app.config import settings
 from app.db import get_db
 from app.errors import AppError
 from app.models import AdminUser
+from app.roles import ACCOUNT_ROLES, ROLE_ADMIN, ROLE_SUPER_ADMIN, ROLE_USER
 
 logger = logging.getLogger("recsterio.auth")
 ALGORITHM = "HS256"
@@ -48,17 +49,19 @@ def verify_password(password: str, password_hash: str) -> bool:
 
 def create_access_token(
     email: str,
-    role: str = "admin",
+    role: str = ROLE_ADMIN,
     folder_ids: Optional[list] = None,
     ttl_minutes: Optional[int] = None,
     folder_roles: Optional[dict] = None,
 ) -> tuple[str, datetime]:
     """Issue a bearer token.
 
-    `role` is 'admin' | 'member' | 'guest'. A guest token carries `folders` —
-    the only folders it may read — and the role it was granted on each, so a
-    passcode or share link grants exactly the access it was created for and
-    nothing else.
+    `role` is an account role from `app.roles`, or 'guest'. A guest token
+    carries `folders` — the only folders it may read — and the role it was
+    granted on each, so a passcode or share link grants exactly the access it
+    was created for and nothing else. For account tokens the claim is
+    informational: `_resolve_principal` re-reads the role from the database,
+    so a stale claim can never widen what the row allows.
     """
     minutes = settings.access_token_ttl_minutes if ttl_minutes is None else ttl_minutes
     now = datetime.now(timezone.utc)
@@ -122,16 +125,16 @@ def upsert_google_user(
     if user is None and email:
         user = db.execute(select(AdminUser).where(AdminUser.email == email)).scalar_one_or_none()
     if user is None:
-        # A Google account is a dataset *member*, never an operator. The seeded
-        # bootstrap account stays the only 'admin'.
+        # A Google account is a dataset user, never an operator. Promotions to
+        # developer/reviewer/admin happen through the user-management surface,
+        # deliberately and by the super admin.
         user = AdminUser(
             email=email or f"{google_sub}@google.user",
             google_sub=google_sub,
-            role="member",
+            role=ROLE_USER,
+            is_active=True,
         )
         db.add(user)
-    elif not user.role:
-        user.role = "member"
     user.google_sub = google_sub
     if email:
         user.email = email
@@ -139,14 +142,23 @@ def upsert_google_user(
         user.name = name
     if avatar_url:
         user.avatar_url = avatar_url
-    user.is_active = True
+    # `is_active` is deliberately NOT refreshed here: a super admin who
+    # deactivated the account must not have Google sign-in resurrect it. The
+    # login check rejects a deactivated row either way.
     db.commit()
     db.refresh(user)
     return user
 
 
 def seed_admin_user(db: Session) -> Optional[AdminUser]:
-    """Create the bootstrap admin from ADMIN_EMAIL/ADMIN_PASSWORD if not present."""
+    """Create (or promote) the bootstrap super admin from ADMIN_EMAIL/ADMIN_PASSWORD.
+
+    The account this names is the deployment's one super admin: the previous
+    behaviour left an existing row at whatever role it carried, which would
+    strand a deployment whose ADMIN_EMAIL was later pointed at an account
+    created before the role system existed. Promotion is idempotent and never
+    touches the password — rotating ADMIN_PASSWORD is an operator decision.
+    """
     email = (settings.admin_email or "").strip().lower()
     password = settings.admin_password
     if not email or not password:
@@ -156,14 +168,22 @@ def seed_admin_user(db: Session) -> Optional[AdminUser]:
         select(AdminUser).where(AdminUser.email == email)
     ).scalar_one_or_none()
     if existing is not None:
+        if existing.role != ROLE_SUPER_ADMIN:
+            existing.role = ROLE_SUPER_ADMIN
+            db.commit()
+            db.refresh(existing)
+            logger.info("Promoted %s to super admin", email)
         return existing
     user = AdminUser(
-        email=email, password_hash=hash_password(password), is_active=True
+        email=email,
+        password_hash=hash_password(password),
+        is_active=True,
+        role=ROLE_SUPER_ADMIN,
     )
     db.add(user)
     db.commit()
     db.refresh(user)
-    logger.info("Seeded admin user %s", email)
+    logger.info("Seeded super admin user %s", email)
     return user
 
 
@@ -180,7 +200,7 @@ class Principal:
 
     @property
     def is_signed_in(self) -> bool:
-        return self.role in ("admin", "member")
+        return self.role in ACCOUNT_ROLES
 
     @property
     def is_guest(self) -> bool:
@@ -201,10 +221,24 @@ def actor_role(actor: str) -> str:
 def _resolve_principal(
     request: Request, token: str, db: Session, required: bool = True
 ) -> Principal:
+    # `X-Requested-By` lets the bot attribute a mutation to the Telegram user
+    # behind it — but ONLY the bot may use it. It used to be honored for any
+    # value with no credential check at all, so any caller could become
+    # "admin:anyone@x" by typing it. Now it is accepted only together with
+    # the bot service token and only for the `telegram:` prefix it exists to
+    # carry; every other combination falls through to the ordinary bearer
+    # path below (typically a 401). The bot always sends both headers, so no
+    # legitimate flow changes.
     requested_by = request.headers.get(REQUESTED_BY_HEADER)
     if requested_by:
         actor = requested_by.strip()[:128]
-        return Principal(actor, actor_role(actor), actor.split(":", 1)[1] or None)
+        if (
+            ":" in actor
+            and actor.split(":", 1)[0] == "telegram"
+            and settings.bot_api_token
+            and token == settings.bot_api_token
+        ):
+            return Principal(actor, actor_role(actor), actor.split(":", 1)[1] or None)
 
     # Service token for the Telegram bot.
     if settings.bot_api_token and token == settings.bot_api_token:
@@ -218,11 +252,10 @@ def _resolve_principal(
         return Principal("guest:anonymous", "guest")
 
     payload = decode_token(token)
-    role = payload.get("role") or "admin"
     sub = str(payload.get("sub"))
 
     # A guest token is self-describing; it names no account row.
-    if role == "guest":
+    if payload.get("role") == "guest":
         return Principal(
             f"guest:{sub}",
             "guest",
@@ -231,12 +264,16 @@ def _resolve_principal(
             dict(payload.get("roles") or {}),
         )
 
+    # An account token is resolved against the database, which is the role's
+    # source of truth: the claim in the JWT is not trusted, so a stale or
+    # hand-crafted token cannot widen what the row allows, and a role changed
+    # through user management applies on the target's very next request.
     user = db.execute(
         select(AdminUser).where(AdminUser.email == sub)
     ).scalar_one_or_none()
     if user is None or not user.is_active:
         raise AppError(401, "unauthorized", "Invalid or expired token.")
-    return Principal(f"{role}:{user.email}", role, user.email)
+    return Principal(f"{user.role}:{user.email}", user.role, user.email)
 
 
 def resolve_actor(
@@ -246,7 +283,8 @@ def resolve_actor(
     db: Session,
     required: bool = True,
 ) -> str:
-    """Return the actor string: 'admin:<email>' | 'member:<email>' | 'guest:<id>' | 'telegram:bot'."""
+    """Return the actor string: '<role>:<email>' for an account, 'guest:<id>',
+    'telegram:<uid>' / 'telegram:bot' for the bot, 'system' for the worker."""
     return _resolve_principal(request, token, db, required).actor
 
 
@@ -292,12 +330,3 @@ def get_optional_principal(
     return _resolve_principal(
         request, credentials.credentials if credentials else "", db, required=False
     )
-
-
-def require_admin(
-    actor: str = Depends(get_actor),
-) -> str:
-    """Some routes are admin-only (not used by the bot)."""
-    if not actor.startswith("admin:"):
-        raise AppError(403, "forbidden", "This action requires an admin token.")
-    return actor

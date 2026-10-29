@@ -32,7 +32,7 @@ def test_recording_tvna_assigns_a_sequential_id(client, auth_headers):
     # Defaults the collector does not have to type.
     assert body["source_type"] == "Video"
     assert body["collection_method"] == "Manual browse"
-    assert body["collected_by"] == "admin:admin@test.local"
+    assert body["collected_by"] == "super_admin:admin@test.local"
     assert body["collection_date"]
 
 
@@ -165,6 +165,34 @@ def test_telegram_link_rejects_an_empty_file_id(client, auth_headers):
         headers=auth_headers,
     )
     assert resp.status_code == 422
+
+
+def test_relinking_without_a_message_id_clears_the_old_one(client, auth_headers):
+    """The file_id/message_id pair must describe one message.
+
+    Re-linking with a new file_id but no message_id used to keep the old
+    message_id, leaving a pair that pointed at a message the new file never
+    arrived in. Omitting the message_id now clears it.
+    """
+    video = make_video(client, auth_headers)
+    first = client.post(
+        f"/api/v1/videos/{video['id']}/telegram",
+        json={"file_id": "AAA", "message_id": 42},
+        headers=auth_headers,
+    )
+    assert first.status_code == 200, first.text
+    assert first.json()["telegram_file_id"] == "AAA"
+    assert first.json()["telegram_message_id"] == 42
+
+    second = client.post(
+        f"/api/v1/videos/{video['id']}/telegram",
+        json={"file_id": "BBB"},
+        headers=auth_headers,
+    )
+    assert second.status_code == 200, second.text
+    body = second.json()
+    assert body["telegram_file_id"] == "BBB"
+    assert body["telegram_message_id"] is None
 
 
 # ----------------------------------------------------- downloader metadata helpers

@@ -25,6 +25,12 @@ from sqlalchemy.orm import Session
 from app.auth import Principal
 from app.errors import AppError
 from app.models import AdminUser, Folder, FolderMember, Video
+from app.roles import (
+    ADMIN_TIER,
+    OPERATOR_ROLES,
+    ROLE_SUPER_ADMIN,
+    TRANSCRIPT_EDIT_ROLES,
+)
 
 # Role strength: "editor can do anything a viewer can" needs no special cases.
 ROLE_RANK = {"viewer": 1, "commenter": 2, "editor": 3}
@@ -79,7 +85,7 @@ def role_on_folder(
     db: Session, folder: Folder, principal: Principal, user: Optional[AdminUser] = None
 ) -> Optional[str]:
     """The caller's effective role on `folder`, or None when it is invisible."""
-    if principal.role == "admin":
+    if principal.role in ADMIN_TIER:
         return "editor"
     if principal.role == "telegram":
         return "editor"
@@ -109,7 +115,7 @@ def visible_folders(db: Session, principal: Principal) -> dict[UUID, str]:
     One query for the folders, one for memberships — cheap for a whole page.
     """
     folders = list(db.execute(select(Folder)).scalars())
-    if principal.role in ("admin", "telegram"):
+    if principal.role in ADMIN_TIER + ("telegram",):
         return {f.id: "editor" for f in folders}
 
     user = user_for(db, principal)
@@ -148,7 +154,7 @@ def video_role(
     db: Session, video: Video, principal: Principal, user: Optional[AdminUser] = None
 ) -> Optional[str]:
     """The role the caller holds on a video (its folder decides, unless it is theirs)."""
-    if principal.role == "admin":
+    if principal.role in ADMIN_TIER:
         return "editor"
     if principal.role == "telegram":
         return "editor"
@@ -220,11 +226,24 @@ def require_operator(principal: Principal) -> None:
     the operator — the console and the bot's admin-gated commands — and a
     member who can see one folder must not read the queue that serves them all.
     """
-    if principal.role not in ("admin", "telegram"):
+    if principal.role not in (OPERATOR_ROLES + ("telegram",)):
         raise AppError(
             403,
             "forbidden",
             "This is an operator-only resource.",
+            [{"role": principal.role}],
+        )
+
+
+def require_super_admin(principal: Principal) -> None:
+    """User management: creating accounts and changing roles re-writes who may
+    do what, so it belongs to the one account that owns the deployment —
+    not to every admin, or the role system could vote itself wider."""
+    if principal.role != ROLE_SUPER_ADMIN:
+        raise AppError(
+            403,
+            "forbidden",
+            "Only the super admin manages users.",
             [{"role": principal.role}],
         )
 
@@ -248,3 +267,21 @@ def require_video(
             [{"video_id": str(video.id), "role": role, "required": need}],
         )
     return role
+
+
+def require_transcript_editor(
+    db: Session, video: Video, principal: Principal
+) -> str:
+    """The transcript-edit routes: `require_video(need="editor")`, widened for
+    the transcript-edit roles (`app.roles`).
+
+    Reviewing a dataset means correcting its transcripts, so a reviewer may
+    edit the transcript of *any* video, whatever folder it lives in — the
+    per-folder role says nothing useful about who should fix a wrong word.
+    Everything heavier (moving or deleting the media, ingesting into a
+    folder) keeps the plain editor requirement, so this widening stops at
+    the transcript text.
+    """
+    if principal.role in TRANSCRIPT_EDIT_ROLES:
+        return "editor"
+    return require_video(db, video, principal, need="editor")

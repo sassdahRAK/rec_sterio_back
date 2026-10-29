@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import httpx
+import secrets
+from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, Request
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from app.auth import (
@@ -17,13 +19,16 @@ from app.auth import (
 from app.config import settings
 from app.db import get_db
 from app.errors import AppError
-from app.models import AdminUser
+from app.models import AdminUser, LinkCode
+from app.routers.passcodes import CODE_ALPHABET, hash_code
 from app.schemas import (
     GoogleCredentialRequest,
     GuestTokenOut,
     LoginRequest,
     LoginResponse,
     PrincipalOut,
+    TelegramLinkOut,
+    TelegramLinkStatusOut,
 )
 from app.security import enforce_rate_limit
 
@@ -62,15 +67,15 @@ def login(
     ).scalar_one_or_none()
     if user is None or not user.is_active or not verify_password(payload.password, user.password_hash):
         raise AppError(401, "unauthorized", "Invalid email or password.")
-    # The role must go into the token, not just the response body: every
-    # authorization decision reads the JWT, so a member signed in with an
-    # 'admin' token would be an admin.
-    token, expires = create_access_token(user.email, user.role or "admin")
+    # The role travels in the token for the client's convenience; the server
+    # re-reads it from the database on every request (`auth._resolve_principal`),
+    # so a changed role applies immediately, stale claim or not.
+    token, expires = create_access_token(user.email, user.role)
     return LoginResponse(
         token=token,
         email=user.email,
         expires_at=expires,
-        role=user.role or "admin",
+        role=user.role,
         name=user.name,
     )
 
@@ -96,8 +101,8 @@ def google_login(
     """Sign in with a Google Identity Services ID token (instruction.txt #2).
 
     The browser gets the credential; the server verifies it with Google before
-    trusting any claim. A Google account becomes a *member*, never an operator —
-    the seeded bootstrap account is the only admin.
+    trusting any claim. A Google account becomes a plain user, never an
+    operator — promotions happen through the user-management surface.
     """
     if not settings.google_client_id:
         raise AppError(
@@ -144,12 +149,12 @@ def google_login(
         name=claims.get("name"),
         avatar_url=claims.get("picture"),
     )
-    token, expires = create_access_token(user.email, user.role or "member")
+    token, expires = create_access_token(user.email, user.role)
     return LoginResponse(
         token=token,
         email=user.email,
         expires_at=expires,
-        role=user.role or "member",
+        role=user.role,
         name=user.name,
     )
 
@@ -173,3 +178,88 @@ def me(
         avatar_url=user.avatar_url if user else None,
         folder_ids=sorted(principal.scoped_folder_ids),
     )
+
+
+# --------------------------------------------- Telegram account linking (bot)
+# The console half of the link flow: sign in, generate a one-time code, hand
+# it to the bot. The bot half (redeeming the code) lives in bot_users.py,
+# authenticated by the service token instead of a session JWT.
+
+
+def _require_console_account(db: Session, principal: Principal) -> AdminUser:
+    """Only a signed-in console account (any account role) may manage its link.
+
+    A guest token resolves fine through `get_principal`, and so does the bot's
+    service identity — but neither names an AdminUser row, and a link code
+    must always belong to a real account.
+    """
+    if not principal.email:
+        raise AppError(
+            403, "forbidden", "Sign in to a console account to manage its Telegram link."
+        )
+    user = db.execute(
+        select(AdminUser).where(AdminUser.email == principal.email)
+    ).scalar_one_or_none()
+    if user is None:
+        raise AppError(
+            403, "forbidden", "Sign in to a console account to manage its Telegram link."
+        )
+    return user
+
+
+@router.post("/telegram-link", response_model=TelegramLinkOut)
+def create_telegram_link(
+    principal: Principal = Depends(get_principal),
+    db: Session = Depends(get_db),
+) -> TelegramLinkOut:
+    """Generate a one-time code that binds the caller's Telegram account.
+
+    The code is 8 characters from the same readable alphabet as folder
+    passcodes and only its sha256 hash is stored, so it is returned here
+    exactly once and never again. Issuing a new code retires any previous
+    outstanding one: at most one live code per account, so a code left on a
+    screen cannot be redeemed after the user generates a fresh one.
+    """
+    user = _require_console_account(db, principal)
+    now = datetime.now(timezone.utc)
+    db.execute(
+        update(LinkCode)
+        .where(LinkCode.admin_user_id == user.id, LinkCode.revoked_at.is_(None))
+        .values(revoked_at=now)
+    )
+    code = "".join(secrets.choice(CODE_ALPHABET) for _ in range(8))
+    link = LinkCode(
+        code_hash=hash_code(code),
+        admin_user_id=user.id,
+        expires_at=now + timedelta(minutes=settings.link_code_ttl_minutes),
+    )
+    db.add(link)
+    db.commit()
+    db.refresh(link)
+    deep_link = (
+        f"https://t.me/{settings.telegram_bot_username}?start=link-{code}"
+        if settings.telegram_bot_username
+        else None
+    )
+    return TelegramLinkOut(code=code, deep_link=deep_link, expires_at=link.expires_at)
+
+
+@router.get("/telegram-link", response_model=TelegramLinkStatusOut)
+def get_telegram_link(
+    principal: Principal = Depends(get_principal),
+    db: Session = Depends(get_db),
+) -> TelegramLinkStatusOut:
+    """The caller's own Telegram link, for the console's account page."""
+    user = _require_console_account(db, principal)
+    return TelegramLinkStatusOut(telegram_user_id=user.telegram_user_id)
+
+
+@router.delete("/telegram-link", status_code=204)
+def delete_telegram_link(
+    principal: Principal = Depends(get_principal),
+    db: Session = Depends(get_db),
+) -> None:
+    """Withdraw the caller's own Telegram link (a no-op when unlinked)."""
+    user = _require_console_account(db, principal)
+    user.telegram_user_id = None
+    db.commit()

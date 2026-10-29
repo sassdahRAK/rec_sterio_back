@@ -173,6 +173,63 @@ def test_no_session_opts_are_sent_when_nothing_is_configured(monkeypatch):
         assert key not in params
 
 
+# ---------------------------------------------------- per-user cookies file
+
+
+def test_per_user_cookiefile_is_used_and_the_browser_jar_disabled(monkeypatch, tmp_path):
+    """The requesting user's own cookies win, and the operator's browser jar
+    is switched off: yt-dlp would otherwise MERGE the two sessions."""
+    _clear_ytdlp_settings(monkeypatch)
+
+    def _stop(self, url, download):
+        raise _FakeYoutubeDLError("stop after construction")
+
+    fake = _install_fake_ytdlp(monkeypatch, extract_info=_stop)
+    monkeypatch.setattr(settings, "media_root", str(tmp_path))
+    cookies = tmp_path / "user-cookies.txt"
+    cookies.write_text("# Netscape HTTP Cookie File\n")
+
+    with pytest.raises(TransientDownloadError):
+        download(TIKTOK_URL, uuid.uuid4(), cookiefile=str(cookies))
+    params = fake.YoutubeDL.last_params
+    assert params["cookiefile"] == str(cookies)
+    # Explicit override (the key is present and None), not merely absent.
+    assert "cookiesfrombrowser" in params
+    assert params.get("cookiesfrombrowser") is None
+
+
+def test_per_user_cookiefile_wins_over_the_browser_setting(monkeypatch, tmp_path):
+    _clear_ytdlp_settings(monkeypatch)
+    fake = _install_fake_ytdlp(monkeypatch)
+    monkeypatch.setattr(settings, "ytdlp_cookies_from_browser", "chrome")
+    monkeypatch.setattr(settings, "media_root", str(tmp_path))
+    cookies = tmp_path / "user-cookies.txt"
+    cookies.write_text("# Netscape HTTP Cookie File\n")
+
+    with pytest.raises(TransientDownloadError):
+        download(TIKTOK_URL, uuid.uuid4(), cookiefile=str(cookies))
+    params = fake.YoutubeDL.last_params
+    assert params["cookiefile"] == str(cookies)
+    assert params.get("cookiesfrombrowser") is None
+
+
+def test_missing_per_user_cookiefile_falls_back_to_server_defaults(monkeypatch, tmp_path):
+    """A vanished per-user file downgrades to the server session, not an error."""
+    _clear_ytdlp_settings(monkeypatch)
+    fake = _install_fake_ytdlp(monkeypatch)
+    server_cookies = tmp_path / "server-cookies.txt"
+    server_cookies.write_text("# Netscape HTTP Cookie File\n")
+    monkeypatch.setattr(settings, "ytdlp_cookies_file", str(server_cookies))
+    monkeypatch.setattr(settings, "media_root", str(tmp_path))
+    missing = tmp_path / "deleted-user-cookies.txt"
+
+    with pytest.raises(TransientDownloadError):
+        download(TIKTOK_URL, uuid.uuid4(), cookiefile=str(missing))
+    params = fake.YoutubeDL.last_params
+    assert params["cookiefile"] == str(server_cookies)
+    assert "cookiesfrombrowser" not in params
+
+
 # ------------------------------------------------------------- config errors
 
 

@@ -25,34 +25,35 @@ def media_bytes() -> bytes:
 MEDIA_BYTES = media_bytes()
 
 
-def member_email(tag: str = "member") -> str:
+def user_email(tag: str = "user") -> str:
     return f"{tag}-{abs(hash(tag)) % 10**8}@test.local"
 
 
-def ensure_member(tag: str = "member") -> str:
-    """Create the account row a member token refers to, and return its email.
+def ensure_user(tag: str = "user") -> str:
+    """Create the account row a user token refers to, and return its email.
 
-    A member token is only accepted when the account exists, and a member cannot
-    log in with a password, so tests that need one create the row directly.
-    `tag` names the account (`ensure_member("viewer")`); it is not an address.
+    A user token is only accepted when the account exists, and a plain user
+    cannot log in with a password (no password is set), so tests that need one
+    create the row directly. `tag` names the account (`ensure_user("viewer")`);
+    it is not an address.
     """
     from app.db import SessionLocal
     from app.models import AdminUser
     from sqlalchemy import select
 
-    email = member_email(tag)
+    email = user_email(tag)
     with SessionLocal() as db:
         user = db.execute(select(AdminUser).where(AdminUser.email == email)).scalar_one_or_none()
         if user is None:
-            db.add(AdminUser(email=email, role="member", password_hash=None))
+            db.add(AdminUser(email=email, role="user", password_hash=None))
             db.commit()
     return email
 
 
-def member_headers(email: str | None = None) -> dict:
-    """A signed-in dataset member (not the operator)."""
-    email = email or member_email()
-    token, _ = create_access_token(email, "member")
+def user_headers(email: str | None = None) -> dict:
+    """A signed-in dataset user (not the operator)."""
+    email = email or user_email()
+    token, _ = create_access_token(email, "user")
     return {"Authorization": f"Bearer {token}"}
 
 
@@ -73,6 +74,20 @@ def bot_headers() -> dict:
     return {
         "Authorization": f"Bearer {settings.bot_api_token}",
         "X-Requested-By": "telegram:bot",
+    }
+
+
+def telegram_user_headers(uid: int) -> dict:
+    """A Telegram user acting through the bot: service token + own id.
+
+    Both credentials are what the /bot-users routes (and the consent gate)
+    require — the token alone is the bot's identity, not the user's.
+    """
+    from app.config import settings
+
+    return {
+        "Authorization": f"Bearer {settings.bot_api_token}",
+        "X-Requested-By": f"telegram:{uid}",
     }
 
 

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Annotated, Any, Dict, List, Literal, Optional
 from uuid import UUID
 
@@ -13,6 +14,8 @@ from pydantic import (
     computed_field,
     field_validator,
 )
+
+from app.roles import ACCOUNT_ROLES, ROLE_USER
 
 
 def _utc_iso(value: datetime) -> str:
@@ -89,6 +92,173 @@ class GoogleCredentialRequest(BaseModel):
     credential: str
 
 
+class TelegramLinkOut(BaseModel):
+    """A freshly generated link code, shown to the console user exactly once.
+
+    Only the sha256 hash is stored; this response is the one place the
+    plaintext code ever appears.
+    """
+
+    code: str
+    # https://t.me/<bot>?start=link-<code> when the bot username is configured;
+    # None in dev, where the console shows the bare code to type instead.
+    deep_link: Optional[str] = None
+    expires_at: UTCDateTime
+
+
+class TelegramLinkStatusOut(BaseModel):
+    """The caller's own Telegram link, or null when unlinked."""
+
+    telegram_user_id: Optional[int] = None
+
+
+# ---------------------------------------------------------------- accounts
+#
+# The user-management surface (`routers/users.py`, super admin only). The rules
+# that can be expressed as a field live here — email shape, the role list from
+# `app.roles`, the password floor — so the route itself only has to handle the
+# two things a schema cannot: the duplicate-email race and self-modification.
+
+# Eight characters: the floor the console's create dialog enforces, so the two
+# cannot disagree about what is acceptable.
+MIN_PASSWORD_LENGTH = 8
+
+
+def _normalized_email(value: str) -> str:
+    """Strip and lower-case, so case alone cannot create a second account.
+
+    A full RFC check is not worth its false negatives; `@` with something on
+    both sides is the minimum that keeps the account reachable by its owner.
+    """
+    email = (value or "").strip().lower()
+    if "@" not in email or " " in email or email.startswith("@") or email.endswith("@"):
+        raise ValueError("A valid email address is required.")
+    return email
+
+
+def _known_role(value: str) -> str:
+    if value not in ACCOUNT_ROLES:
+        raise ValueError("role must be one of: " + ", ".join(ACCOUNT_ROLES) + ".")
+    return value
+
+
+class AdminUserOut(BaseModel):
+    """One console account. Never carries the password hash."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    email: str
+    name: Optional[str] = None
+    role: str
+    is_active: bool
+    telegram_user_id: Optional[int] = None
+    created_at: UTCDateTime
+
+
+class AdminUserListOut(BaseModel):
+    items: List[AdminUserOut]
+    total: int
+    page: int
+    page_size: int
+
+
+class UserCreateIn(BaseModel):
+    email: str
+    name: Optional[str] = None
+    role: str = ROLE_USER
+    password: str = Field(min_length=MIN_PASSWORD_LENGTH)
+
+    @field_validator("email")
+    @classmethod
+    def _email(cls, value: str) -> str:
+        return _normalized_email(value)
+
+    @field_validator("role")
+    @classmethod
+    def _role(cls, value: str) -> str:
+        return _known_role(value)
+
+
+class UserPatchIn(BaseModel):
+    """Everything a super admin may change except the identity itself.
+
+    `email` is deliberately absent: it is the account key (`Principal.email`
+    resolves the row and the actor strings embed it), so renaming one would
+    orphan ownership of every folder, membership and transcript it authored.
+    Every field is optional because this is a PATCH — the route reads
+    `exclude_unset` to tell "leave it alone" from "set it to null".
+    """
+
+    role: Optional[str] = None
+    is_active: Optional[bool] = None
+    name: Optional[str] = None
+    password: Optional[str] = Field(None, min_length=MIN_PASSWORD_LENGTH)
+
+    @field_validator("role")
+    @classmethod
+    def _role(cls, value: Optional[str]) -> Optional[str]:
+        return None if value is None else _known_role(value)
+
+
+class DriveLinkOut(BaseModel):
+    """One connected personal cloud. Never carries the refresh token."""
+
+    id: UUID
+    provider: str  # 'google' | 'onedrive'
+    account_email: str
+    connected_at: UTCDateTime
+
+
+class DriveProviderStatus(BaseModel):
+    """Which providers this deployment offers, for the connect UI."""
+
+    google: bool
+    onedrive: bool
+
+
+class DriveConnectIn(BaseModel):
+    """The OAuth authorization code the provider handed back to the client.
+
+    `redirect_uri` must be the same value the browser sent to the provider's
+    consent screen, or the token exchange is rejected. It is optional so a
+    client can rely on the server's configured default, and the route accepts
+    it only when its origin matches the configured portal origin.
+    """
+
+    provider: str
+    code: str = Field(min_length=1)
+    redirect_uri: Optional[str] = None
+
+    @field_validator("provider")
+    @classmethod
+    def _provider(cls, value: str) -> str:
+        if value not in ("google", "onedrive"):
+            raise ValueError("provider must be 'google' or 'onedrive'.")
+        return value
+
+
+class CloudUploadIn(BaseModel):
+    """Store this upload on the contributor's own cloud instead of server disk."""
+
+    backend: str
+    filename: Optional[str] = Field(None, max_length=255)
+
+    @field_validator("backend")
+    @classmethod
+    def _backend(cls, value: str) -> str:
+        if value not in ("google", "onedrive"):
+            raise ValueError("backend must be 'google' or 'onedrive'.")
+        return value
+
+
+class CloudUploadOut(BaseModel):
+    video_id: UUID
+    upload_url: str
+    upload_headers: Dict[str, str]
+    expires_at: Optional[UTCDateTime] = None
+
+
 # ---------------------------------------------------------------- videos
 
 
@@ -160,6 +330,8 @@ class VideoOut(BaseModel):
     title: Optional[str] = None
     notes: Optional[str] = None
     folder_id: Optional[UUID] = None
+    # Set when this row is a fork of another video, NULL for an ingested one.
+    copied_from_id: Optional[UUID] = None
     position: int = 0
     status: str
     progress: int
@@ -170,6 +342,10 @@ class VideoOut(BaseModel):
     mime_type: Optional[str] = None
     checksum_sha256: Optional[str] = None
     thumbnail_url: Optional[str] = None
+
+    # Personal-cloud storage (the contributor's own Google Drive / OneDrive), so
+    # the detail views can say where the bytes live.
+    storage_backend: Optional[str] = None
 
     # Telegram mirror (instruction.txt #4).
     telegram_file_id: Optional[str] = None
@@ -189,6 +365,24 @@ class VideoOut(BaseModel):
     created_by: str
     created_at: UTCDateTime
     updated_at: UTCDateTime
+
+    # Whether THIS caller could open the video (pass `GET /videos/{id}`'s
+    # `require_video`). The listing routes set it per row for consumers; the
+    # library listings now hide rows a caller cannot open at all, so it is
+    # True for every listed row. Defaults to True: every other VideoOut
+    # response belongs to a caller who has just passed an editor/read check
+    # on exactly this video.
+    can_open: bool = True
+
+    @field_validator("local_path")
+    @classmethod
+    def _mask_local_path(cls, v: Optional[str]) -> Optional[str]:
+        """The model column stores a full server path; the API must not reveal
+        where media lives on disk, so responses carry only the filename.
+        Inherited by VideoDetailOut, which does not redeclare the field."""
+        if not v:
+            return v
+        return Path(v).name
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -242,6 +436,13 @@ class JobOut(BaseModel):
 class VideoDetailOut(VideoOut):
     transcripts: List[TranscriptOut] = Field(default_factory=list)
     jobs: List[JobOut] = Field(default_factory=list)
+    # Readable names for the actor strings, resolved only on the detail view
+    # (a linked Telegram user shows as "Name (email)"). The raw `created_by` /
+    # `collected_by` stay untouched above: they are the authorization source of
+    # truth, and None simply means "no readable name" — the caller shows the
+    # raw string it already has.
+    created_by_display: Optional[str] = None
+    collected_by_display: Optional[str] = None
 
 
 class VideoListOut(BaseModel):
@@ -387,6 +588,13 @@ class VideoFolderUpdate(BaseModel):
     position: Optional[int] = None
 
 
+class VideoCopyIn(BaseModel):
+    """Fork a video into a folder the caller manages, leaving the original alone."""
+
+    folder_id: UUID
+    position: Optional[int] = None
+
+
 # ---------------------------------------------------------------- members
 
 
@@ -479,7 +687,15 @@ class PasscodeListOut(BaseModel):
 
 
 class PasscodeRedeem(BaseModel):
-    folder_id: UUID
+    """Which folder a code opens.
+
+    `folder_id` comes from a link; `folder_name` is typed by the visitor. Either
+    may be omitted — the code alone is enough. The folder list is never exposed,
+    so a visitor cannot learn how many folders exist or what they are called.
+    """
+
+    folder_id: Optional[UUID] = None
+    folder_name: Optional[str] = Field(None, min_length=1, max_length=255)
     code: str = Field(min_length=1, max_length=64)
     device_key: Optional[str] = None
 
@@ -516,6 +732,9 @@ class DataCardOut(BaseModel):
     thumbnail_url: Optional[str] = None
     folder_id: Optional[UUID] = None
     folder_name: Optional[str] = None
+    # A fork of another unit. The card says so instead of passing the copy off
+    # as an independently collected item.
+    copied_from_id: Optional[UUID] = None
     badge: Literal["raw", "cleaned"]
     transcript_id: Optional[UUID] = None
     transcript_preview: Optional[str] = None
@@ -523,6 +742,18 @@ class DataCardOut(BaseModel):
     media_url: str
     audio_url: str
     transcript_url: str
+    # Whether THIS caller could open the card's video (the card dialog loads
+    # its transcript via `GET /videos/{id}`). The dataset listing sets it per
+    # card for consumers; it now hides cards a caller cannot open at all, so
+    # it is True for every card it returns. Defaults to True: every other
+    # builder — the public portal — serves cards pre-filtered to folders the
+    # caller has already passed `require_read` on.
+    can_open: bool = True
+    # Personal-cloud storage: where the bytes live, and whether they can be
+    # read right now (a revoked/disconnected drive leaves the unit listed but
+    # unavailable, rather than failing playback with a 500).
+    storage_backend: Optional[str] = None
+    storage_available: bool = True
 
 
 class PublicFolderOut(BaseModel):
