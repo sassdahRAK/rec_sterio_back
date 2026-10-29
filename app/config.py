@@ -168,6 +168,11 @@ class Settings(BaseSettings):
     # Cross-process heartbeat file (read by GET /health when the worker runs as
     # a separate `python -m app.worker` process).
     worker_heartbeat_file: str = str(BACKEND_DIR / "storage" / "worker_heartbeat.json")
+    # Reclaim budget for a *running* `compress_video` job (seconds). A delivery
+    # transcode is a single ffmpeg run over a whole source and legitimately
+    # takes hours on a large file, so it must not be swept by the generic
+    # stale-run reclaim. Any other job kind keeps the generic 1800 s window.
+    worker_compress_stale_seconds: int = 14400
 
     # ---- http / security ----
     # Both frontends call the API through a same-origin proxy (Vite in dev, Caddy

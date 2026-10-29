@@ -1,9 +1,13 @@
 """Worker behaviour: job handlers, idempotency and graceful degradation."""
 from __future__ import annotations
 
+import threading
+import time
 import wave
+from datetime import timedelta
 from pathlib import Path
 
+from app.config import settings
 from app.db import SessionLocal
 from app.models import Job, Transcript, Video
 from app.services import asr as asr_service
@@ -11,7 +15,8 @@ from app.services import downloader
 from app.services import gemini as gemini_service
 from app.services import storage
 from app.services.downloader import DownloadResult
-from app.worker import queue
+from app.worker import main as worker_main
+from app.worker import queue, runner
 from app.worker.runner import (
     handle_extract_audio,
     handle_gemini_transcribe,
@@ -281,6 +286,126 @@ def test_extract_job_survives_an_mp3_extraction_failure(monkeypatch):
         assert nxt is not None
         assert nxt.status == "queued"
     assert not storage.audio_mp3_file(video_id).exists()
+
+
+def test_worker_alive_stays_true_while_a_handler_runs(monkeypatch, tmp_path):
+    """A busy worker must not look dead.
+
+    Regression (live run): the heartbeat was written only at the top of the
+    poll loop, *before* `run_job`. A 4+ minute compression made it stale, so
+    GET /health reported worker_alive=false (and deploy.sh warned) while both
+    workers were healthy and busy. Intervals/windows here are shrunk so the
+    test takes ~1 s instead of 60 s.
+    """
+    monkeypatch.setattr(worker_main, "heartbeat_interval", lambda: 0.05)
+    # Never read the real heartbeat file a live worker may still be writing.
+    monkeypatch.setattr(
+        worker_main.heartbeat.settings,
+        "worker_heartbeat_file",
+        str(tmp_path / "worker_heartbeat.json"),
+    )
+    monkeypatch.setattr(worker_main, "_last_heartbeat", 0.0)
+
+    started = threading.Event()
+
+    def _slow_handler(db, job):  # noqa: ARG001 - handler signature
+        started.set()
+        time.sleep(2.0)
+
+    monkeypatch.setitem(runner.HANDLERS, "slow-test", _slow_handler)
+
+    worker_main._stop.clear()
+    threads: list[threading.Thread] = []
+    try:
+        with SessionLocal() as db:
+            job = queue.enqueue(db, "slow-test", payload={})
+            db.commit()
+
+        threads = worker_main.start_worker_threads(count=1)
+        assert started.wait(timeout=5.0), "the worker never picked the job up"
+
+        # 0.8 s into a 2 s handler, well past the 0.5 s window used here:
+        # only the heartbeat thread can keep the signal fresh.
+        time.sleep(0.8)
+        assert worker_main.worker_alive(max_age_seconds=0.5) is True
+    finally:
+        worker_main._stop.set()
+        for t in threads:
+            t.join(timeout=5.0)
+        hb = worker_main._heartbeat_thread
+        if hb is not None:
+            hb.join(timeout=5.0)
+        worker_main._stop.clear()
+        worker_main._last_heartbeat = 0.0
+
+
+def test_compress_job_is_not_reclaimed_inside_its_longer_window():
+    """A long transcode is progress, not an abandoned run.
+
+    A `compress_video` row older than the generic 1800 s window but younger
+    than its own (4 h) window must survive `claim_job`; a generic kind in the
+    same state must be reclaimed. Proves the kind-aware mapping applies.
+    """
+    compress_window = max(
+        queue.STALE_RUNNING_SECONDS, int(settings.worker_compress_stale_seconds)
+    )
+    assert compress_window > queue.STALE_RUNNING_SECONDS + 60
+    stale_start = queue.utcnow() - timedelta(seconds=queue.STALE_RUNNING_SECONDS + 60)
+
+    with SessionLocal() as db:
+        compress = queue.enqueue(db, "compress_video", payload={}, priority=50)
+        compress.status = "running"
+        compress.attempts = 1
+        compress.started_at = stale_start
+        generic = queue.enqueue(db, "transcribe", payload={"chain": []}, priority=50)
+        generic.status = "running"
+        generic.attempts = 1
+        generic.started_at = stale_start
+        # Highest-priority claim: lets the sweep's effect be observed as
+        # "queued" instead of the reclaimed row being re-claimed immediately.
+        queue.enqueue(db, "noop", payload={}, priority=1)
+        db.commit()
+        compress_id, generic_id = str(compress.id), str(generic.id)
+
+    with SessionLocal() as db:
+        claimed = queue.claim_job(db)
+        assert claimed is not None and claimed.kind == "noop"
+
+    with SessionLocal() as db:
+        assert db.get(Job, compress_id).status == "running", (
+            "a compress job inside its own window must not be reclaimed"
+        )
+        generic_row = db.get(Job, generic_id)
+        assert generic_row.status == "queued"
+        assert generic_row.last_error == "reclaimed after stale run"
+
+
+def test_touch_running_refreshes_only_a_running_row():
+    """Progress checkpoints move `started_at`; a finished row stays untouched."""
+    old = queue.utcnow() - timedelta(minutes=10)
+    with SessionLocal() as db:
+        running = queue.enqueue(db, "compress_video", payload={})
+        running.status = "running"
+        running.attempts = 1
+        running.started_at = old
+        done = queue.enqueue(db, "compress_video", payload={})
+        done.status = "succeeded"
+        done.started_at = old
+        done.finished_at = queue.utcnow()
+        db.commit()
+        running_id, done_id = str(running.id), str(done.id)
+
+    with SessionLocal() as db:
+        queue.touch_running(db, db.get(Job, running_id))
+        queue.touch_running(db, db.get(Job, done_id))
+
+    with SessionLocal() as db:
+        refreshed = db.get(Job, running_id)
+        untouched = db.get(Job, done_id)
+        assert refreshed.status == "running"
+        assert refreshed.started_at > old
+        assert untouched.status == "succeeded"
+        assert untouched.started_at == old
 
 
 def test_handle_download_passes_the_per_user_cookiefile(monkeypatch, tmp_path):

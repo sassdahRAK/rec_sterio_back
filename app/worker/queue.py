@@ -22,6 +22,27 @@ logger = logging.getLogger("recsterio.queue")
 # be reclaimed (worker crash / restart safety).
 STALE_RUNNING_SECONDS = 1800
 
+# Job kinds whose *legitimate* single run can outlast the generic window above.
+# A delivery transcode encodes a whole source in one ffmpeg pass, and a large
+# file can take hours: reclaiming it mid-encode would let a second worker start
+# another run against the same output path. The value here is the default; the
+# compress budget is configurable (WORKER_COMPRESS_STALE_SECONDS).
+STALE_RUNNING_SECONDS_BY_KIND: Dict[str, int] = {"compress_video": 4 * 3600}
+
+
+def stale_running_windows() -> Dict[str, int]:
+    """Reclaim budget per job kind. Kinds absent here use ``STALE_RUNNING_SECONDS``.
+
+    ``started_at`` is the reference point: "last observed running" (see
+    :func:`touch_running`), so a handler that reports progress stays claimable
+    for a while after it started.
+    """
+    windows = dict(STALE_RUNNING_SECONDS_BY_KIND)
+    windows["compress_video"] = max(
+        STALE_RUNNING_SECONDS, int(settings.worker_compress_stale_seconds)
+    )
+    return windows
+
 # `jobs.status` has no dedicated terminal state for an operator cancellation
 # (the frozen contract lists queued/running/succeeded/failed/dead), so a
 # cancelled job is `failed` with this marker in `last_error`. Every other
@@ -91,13 +112,37 @@ def claim_job(db: Session) -> Optional[Job]:
     """Atomically claim the next eligible job. Returns None if there is nothing to do."""
     now = utcnow()
 
-    # Reclaim jobs abandoned by a crashed worker.
-    stale_before = now - timedelta(seconds=STALE_RUNNING_SECONDS)
+    # Reclaim jobs abandoned by a crashed worker. The window depends on the
+    # kind: a long compress run is legitimate work, not a dead worker, so it
+    # gets a much larger budget than the generic 30 min.
+    reclaimed = {
+        "status": "queued",
+        "scheduled_at": now,
+        "last_error": "reclaimed after stale run",
+    }
+    windows = stale_running_windows()
+    # Kinds with their own window are excluded from the generic sweep.
     db.execute(
         update(Job)
-        .where(Job.status == "running", Job.started_at.isnot(None), Job.started_at < stale_before)
-        .values(status="queued", scheduled_at=now, last_error="reclaimed after stale run")
+        .where(
+            Job.status == "running",
+            Job.started_at.isnot(None),
+            Job.kind.notin_(tuple(windows)),
+            Job.started_at < now - timedelta(seconds=STALE_RUNNING_SECONDS),
+        )
+        .values(**reclaimed)
     )
+    for kind, seconds in windows.items():
+        db.execute(
+            update(Job)
+            .where(
+                Job.status == "running",
+                Job.started_at.isnot(None),
+                Job.kind == kind,
+                Job.started_at < now - timedelta(seconds=seconds),
+            )
+            .values(**reclaimed)
+        )
 
     stmt = (
         select(Job)
@@ -121,6 +166,28 @@ def claim_job(db: Session) -> Optional[Job]:
     db.commit()
     db.refresh(job)
     return job
+
+
+def touch_running(db: Session, job: Job) -> None:
+    """Refresh a running job's ``started_at`` because it is still making progress.
+
+    Semantics: ``started_at`` means *last observed running*, not necessarily the
+    first claim. ``claim_job`` already reclaims on this column, so a long
+    handler that calls this at each progress checkpoint can never age out into
+    a second worker while it is still working. ``created_at`` still records when
+    the job was made.
+
+    One conditional UPDATE (no ORM dirty state), committed immediately so other
+    workers' claim sweep sees the touch. Terminal rows (cancelled/succeeded/
+    failed/dead) are not modified.
+    """
+    db.execute(
+        update(Job)
+        .where(Job.id == job.id, Job.status == "running")
+        .values(started_at=utcnow())
+        .execution_options(synchronize_session=False)
+    )
+    db.commit()
 
 
 def backoff_seconds(attempts: int) -> int:

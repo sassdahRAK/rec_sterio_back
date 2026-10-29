@@ -1175,15 +1175,16 @@ def stream_media(
     db: Session = Depends(get_db),
     principal=Depends(get_optional_principal),
 ) -> Response:
-    """Stream a video's bytes; `variant=compressed` serves the delivery copy.
+    """Stream a video's bytes; `variant=compressed` prefers the delivery copy.
 
     The compressed variant is delivery-only: ASR never reads it. It shares the
     original's authorization (`_authorize_media` runs before anything else) and
-    its streaming/range machinery. When no compressed copy exists the route
-    answers the one not-ready code the bot knows (`compressed_not_ready`) and —
-    for an original above the delivery threshold — queues the compress job so a
-    retry a little later can succeed. The original is never served in place of
-    the copy: the bot would be handed >50 MB bytes it cannot send.
+    its streaming/range machinery. The route never answers a not-ready code for
+    a variant it can satisfy: when no compressed copy exists it serves the
+    original with `X-Compressed: false` and — for an original above the delivery
+    threshold — queues the compress job so a later request gets the small copy.
+    The bot size-checks before sending, so degrading to the original is safe.
+    Only a video with no media at all answers `compressed_not_ready`.
     """
     video = get_video_or_404(db, video_id)
     # Auth first: the compressed variant must be exactly as private/public as
@@ -1198,13 +1199,8 @@ def stream_media(
         )
     range_header = request.headers.get("range")
     if video.storage_backend:
-        # Out of scope: no compressed copy is made of a cloud-backed video.
-        if variant == "compressed":
-            raise AppError(
-                404,
-                "compressed_not_ready",
-                "No compressed delivery copy is produced for a cloud-stored video.",
-            )
+        # Out of scope: a cloud-backed video never gets a compressed copy, so
+        # the compressed variant is the cloud original, marked as such.
         response = _open_cloud_stream(db, video, range_header)
         response.headers["X-Compressed"] = "false"
         return response
@@ -1215,26 +1211,30 @@ def stream_media(
             return _serve_local_media(
                 path, "video/mp4", range_header, compressed=True
             )
-        # No copy yet: every absent case is the same 404 code; an original big
-        # enough to need delivery compression gets its job queued right here.
+        # No copy yet: queue the delivery job when the original is big enough,
+        # then degrade to the original instead of making the caller wait. The
+        # bot size-checks before sending, so the original is safe to hand back.
         original_path = storage.find_media_file(video_id)
-        big_enough = (
-            original_path is not None
-            and original_path.exists()
-            and storage.file_size(original_path)
-            > settings.compress_threshold_mb * 1024 * 1024
-        )
-        queued = _enqueue_compress(db, video) if big_enough else None
-        if queued is not None:
-            detail = "The compressed copy is being prepared; ask again shortly."
-        elif big_enough:
-            detail = (
-                "Compression already failed for this video; the operator can "
-                "run POST /compress to try again."
+        if original_path is None or not original_path.exists():
+            # Nothing on disk at all: there is no original to fall back to.
+            raise AppError(
+                404,
+                "compressed_not_ready",
+                "No compressed delivery copy exists for this video.",
             )
-        else:
-            detail = "No compressed delivery copy exists for this video."
-        raise AppError(404, "compressed_not_ready", detail)
+        if (
+            storage.file_size(original_path)
+            > settings.compress_threshold_mb * 1024 * 1024
+        ):
+            _enqueue_compress(db, video)
+        mime = (
+            video.mime_type
+            or mimetypes.guess_type(original_path.name)[0]
+            or "application/octet-stream"
+        )
+        return _serve_local_media(
+            original_path, mime, range_header, compressed=False
+        )
 
     path = storage.find_media_file(video_id)
     if path is None or not path.exists():

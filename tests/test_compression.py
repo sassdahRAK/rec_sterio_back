@@ -15,8 +15,9 @@ import pytest
 
 from app.config import settings
 from app.db import SessionLocal
-from app.models import Job, Video
+from app.models import AdminUser, DriveLink, Job, Video
 from app.services import asr as asr_service
+from app.services import cloud_providers
 from app.services import storage
 from app.worker import queue
 from app.worker.runner import compress_plan
@@ -440,9 +441,9 @@ def test_compressed_variant_serves_the_copy(client, auth_headers):
     assert resp.content == payload
 
 
-def test_compressed_variant_not_ready_answers_one_code(client, auth_headers):
-    """A small original has (and needs) no copy: 404 compressed_not_ready, no job."""
-    video_id, _original = _upload_with_bytes(client, auth_headers)
+def test_missing_copy_serves_the_original(client, auth_headers):
+    """A small original has no copy: 200, X-Compressed false, the original, no job."""
+    video_id, original = _upload_with_bytes(client, auth_headers)
     assert storage.find_compressed_file(video_id) is None
 
     resp = client.get(
@@ -451,8 +452,9 @@ def test_compressed_variant_not_ready_answers_one_code(client, auth_headers):
         headers=auth_headers,
     )
 
-    assert resp.status_code == 404, resp.text
-    assert resp.json()["error"]["code"] == "compressed_not_ready"
+    assert resp.status_code == 200, resp.text
+    assert resp.headers["x-compressed"] == "false"
+    assert resp.content == original
     with SessionLocal() as db:
         rows = (
             db.query(Job)
@@ -485,30 +487,35 @@ def test_missing_original_also_answers_compressed_not_ready(client, auth_headers
     assert resp.json()["error"]["code"] == "compressed_not_ready"
 
 
-def test_big_original_enqueues_compress_and_answers_not_ready(client, auth_headers):
-    """>50 MB and no copy: 404 + the compress job, queued exactly once."""
+def test_big_original_queues_compress_and_still_serves_the_original(
+    client, auth_headers
+):
+    """>50 MB and no copy: the original is served, and the job queued exactly once."""
     video_id, _original = _upload_with_bytes(client, auth_headers)
     fixture = large_media_file()
     if fixture is None:
         pytest.skip("ffmpeg is unavailable for the large fixture")
-    assert fixture.stat().st_size > 50 * MIB
-    storage.find_media_file(video_id).write_bytes(fixture.read_bytes())
+    original_bytes = fixture.read_bytes()
+    assert len(original_bytes) > 50 * MIB
+    storage.find_media_file(video_id).write_bytes(original_bytes)
 
     first = client.get(
         f"{API}/videos/{video_id}/media",
         params={"variant": "compressed"},
         headers=auth_headers,
     )
-    assert first.status_code == 404, first.text
-    assert first.json()["error"]["code"] == "compressed_not_ready"
+    assert first.status_code == 200, first.text
+    assert first.headers["x-compressed"] == "false"
+    assert first.content == original_bytes
 
     second = client.get(
         f"{API}/videos/{video_id}/media",
         params={"variant": "compressed"},
         headers=auth_headers,
     )
-    assert second.status_code == 404, second.text
-    assert second.json()["error"]["code"] == "compressed_not_ready"
+    assert second.status_code == 200, second.text
+    assert second.headers["x-compressed"] == "false"
+    assert second.content == original_bytes
 
     with SessionLocal() as db:
         rows = (
@@ -519,6 +526,66 @@ def test_big_original_enqueues_compress_and_answers_not_ready(client, auth_heade
         assert len(rows) == 1
         assert rows[0].status == "queued"
         assert rows[0].priority == 90
+
+
+def test_cloud_video_compressed_variant_serves_the_original(
+    client, auth_headers, monkeypatch
+):
+    """A cloud-backed video has no copy: the compressed variant proxies the
+    cloud original with X-Compressed: false (compressing cloud files is out of
+    scope), never a not-ready error."""
+    owner = ensure_user("cloud-media-owner")
+    blob = b"\x00\x00\x00\x18ftypmp42" + b"c" * 96
+    with SessionLocal() as db:
+        user = db.query(AdminUser).filter(AdminUser.email == owner).one()
+        link = DriveLink(
+            user_id=user.id,
+            provider="google",
+            account_email="cloud@example.com",
+            refresh_token="stored-refresh-token",
+        )
+        db.add(link)
+        db.commit()
+        db.refresh(link)
+        video = Video(
+            source_url=f"https://example.com/cloud-{uuid4().hex}",
+            platform="youtube",
+            status="downloaded",
+            progress=100,
+            storage_backend="google",
+            drive_file_id="file-1",
+            drive_link_id=link.id,
+            mime_type="video/mp4",
+        )
+        db.add(video)
+        db.commit()
+        db.refresh(video)
+        video_id = str(video.id)
+
+    monkeypatch.setattr("app.routers.videos.decrypt_token", lambda stored: stored)
+    monkeypatch.setattr(
+        cloud_providers, "refresh_access_token", lambda provider, rt: "access"
+    )
+
+    def _open(provider, access, file_id, range_header=None):
+        return cloud_providers.CloudRead(
+            status=206 if range_header else 200,
+            headers={"Content-Type": "video/mp4"},
+            size=len(blob),
+            body=iter([blob]),
+        )
+
+    monkeypatch.setattr(cloud_providers, "open_download", _open)
+
+    resp = client.get(
+        f"{API}/videos/{video_id}/media",
+        params={"variant": "compressed"},
+        headers=auth_headers,
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.headers["x-compressed"] == "false"
+    assert resp.content == blob
 
 
 def test_variant_validation_and_original_unchanged(client, auth_headers):

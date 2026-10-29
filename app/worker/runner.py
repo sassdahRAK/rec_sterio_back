@@ -801,6 +801,12 @@ def handle_compress_video(db: Session, job: Job) -> None:
     try:
         for spec in plan:
             queue.ensure_not_cancelled(db, job)
+            # One encode rung can run for minutes (hours on a large source).
+            # Refresh the claim's `started_at` as progress is made so the
+            # stale-run sweep cannot reclaim this job mid-encode and let a
+            # second worker start another ffmpeg against the same path.
+            # Once per rung: no per-second database chatter.
+            queue.touch_running(db, job)
             tmp_out = dest.with_name(
                 f"{dest.stem}-{spec['height'] or 'src'}p.mp4"
             )
