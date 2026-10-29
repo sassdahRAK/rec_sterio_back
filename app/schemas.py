@@ -215,6 +215,11 @@ class DriveProviderStatus(BaseModel):
 
     google: bool
     onedrive: bool
+    # OAuth client ids are public by design — they appear in the browser's
+    # consent URL — so publishing them lets the portal build that URL without
+    # a rebuild. `None` means this provider is not configured on this server.
+    google_client_id: Optional[str] = None
+    onedrive_client_id: Optional[str] = None
 
 
 class DriveConnectIn(BaseModel):

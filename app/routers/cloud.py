@@ -140,9 +140,21 @@ def _require_link(user: AdminUser, provider: str, db: Session) -> DriveLink:
 
 @router.get("/providers", response_model=schemas.DriveProviderStatus)
 def provider_status() -> schemas.DriveProviderStatus:
-    """Which providers this deployment offers (both OAuth apps configured)."""
+    """Which providers this deployment offers.
+
+    Both OAuth apps configured; also publishes each provider's public client
+    id so the portal can build the consent URL without a rebuild. A provider
+    that is only half configured (no secret) still reports `False` and leaks
+    no id at all.
+    """
     available = cloud_providers.providers_available()
-    return schemas.DriveProviderStatus(**available)
+    return schemas.DriveProviderStatus(
+        **available,
+        google_client_id=(
+            settings.drive_google_client_id or settings.google_client_id
+        ) if available["google"] else None,
+        onedrive_client_id=settings.onedrive_client_id if available["onedrive"] else None,
+    )
 
 
 @router.get("/links", response_model=list[schemas.DriveLinkOut])

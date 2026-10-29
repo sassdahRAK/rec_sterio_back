@@ -100,7 +100,50 @@ def _connect(client, admin, provider, email, monkeypatch):
 
 def test_providers_reflect_whether_the_oauth_apps_are_configured(client, drive_config):
     body = client.get(f"{API}/cloud/providers").json()
-    assert body == {"google": True, "onedrive": True}
+    assert body["google"] is True
+    assert body["onedrive"] is True
+
+
+def _unconfigure(monkeypatch, settings, provider: str) -> None:
+    """Hide one OAuth app (id + secret) exactly the way the deployment would:
+    `providers_available` must then report it False and publish no client id."""
+    if provider == ONEDRIVE:
+        monkeypatch.setattr(settings, "onedrive_client_id", None)
+        monkeypatch.setattr(settings, "onedrive_client_secret", None)
+        return
+    monkeypatch.setattr(settings, "google_client_id", None)
+    monkeypatch.setattr(settings, "google_client_secret", None)
+    monkeypatch.setattr(settings, "drive_google_client_id", None)
+    monkeypatch.setattr(settings, "drive_google_client_secret", None)
+
+
+def test_google_client_id_is_published_when_onedrive_is_not_configured(
+    client, drive_config, monkeypatch
+):
+    _unconfigure(monkeypatch, drive_config, ONEDRIVE)
+    body = client.get(f"{API}/cloud/providers").json()
+    assert body["google"] is True
+    assert body["google_client_id"] == "g-id"
+    assert body["onedrive"] is False
+    assert body["onedrive_client_id"] is None
+
+
+def test_onedrive_client_id_is_published_when_google_is_not_configured(
+    client, drive_config, monkeypatch
+):
+    _unconfigure(monkeypatch, drive_config, GOOGLE)
+    body = client.get(f"{API}/cloud/providers").json()
+    assert body["onedrive"] is True
+    assert body["onedrive_client_id"] == "m-id"
+    assert body["google"] is False
+    assert body["google_client_id"] is None
+
+
+def test_onedrive_scope_covers_identity_read():
+    """`/me` needs User.Read on top of the app folder scope, or connect 403s."""
+    assert "https://graph.microsoft.com/Files.ReadWrite.AppFolder" in cloud_providers.ONEDRIVE_SCOPE
+    assert "https://graph.microsoft.com/User.Read" in cloud_providers.ONEDRIVE_SCOPE
+    assert cloud_providers.ONEDRIVE_SCOPE.startswith("offline_access ")
 
 
 def test_a_signed_in_user_connects_a_drive_and_lists_it(client, drive_config, monkeypatch):

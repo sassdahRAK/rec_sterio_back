@@ -57,7 +57,17 @@ DRIVE_FILE_SCOPE = "https://www.googleapis.com/auth/drive.file"
 # files to this app's namespace so contributor uploads never touch the user's
 # other files. Using AppFolder instead of plain Files.ReadWrite is the
 # tightest scope available while still supporting resumable upload sessions.
-ONEDRIVE_SCOPE = "offline_access https://graph.microsoft.com/Files.ReadWrite.AppFolder"
+#
+# User.Read is separate and required: the token exchange reads the signed-in
+# identity from Graph `/me` (userPrincipalName / mail / id) to record which
+# account was linked, and Files.ReadWrite.AppFolder alone does NOT grant `/me`
+# — without User.Read that call answers 403 and the connect fails after the
+# user has already consented. It only permits reading the caller's own basic
+# profile; file access stays confined to the app folder.
+ONEDRIVE_SCOPE = (
+    "offline_access https://graph.microsoft.com/Files.ReadWrite.AppFolder "
+    "https://graph.microsoft.com/User.Read"
+)
 
 PROVIDER_NAMES = ("google", "onedrive")
 
