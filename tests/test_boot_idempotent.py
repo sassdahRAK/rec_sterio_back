@@ -11,7 +11,9 @@ Two paths are pinned here:
 * an unstamped database below target runs the batch once, and the next boot
   issues no ALTER/UPDATE at all;
 * a database that was already migrated before the stamp existed is adopted —
-  stamped without replaying the batch.
+  stamped without replaying the batch's schema work, but still with its
+  idempotent *data* normalisations (`_DATA_FIXUPS`) applied, because the old
+  code never ran those.
 """
 from __future__ import annotations
 
@@ -21,11 +23,18 @@ import pytest
 from sqlalchemy import event, text
 
 from app import db as db_module
-from app.db import SCHEMA_VERSION, engine, init_db
+from app.db import SCHEMA_VERSION, SessionLocal, engine, init_db
+from app.models import Job
 
 # Every statement the batch can emit starts with one of these (see
-# `_ADDED_COLUMNS` / `_add_missing_constraints`); `create_all` never does.
+# `_ADDED_COLUMNS` / `_DATA_FIXUPS` / `_add_missing_constraints`); `create_all`
+# never does.
 _MIGRATION_PREFIXES = ("alter", "update")
+
+# The destructive half of the batch. `create_all` legitimately emits `create
+# table`/`create sequence` on every boot, so match the batch's DDL forms
+# explicitly instead of any `create`.
+_DDL_PREFIXES = ("alter table", "create index", "create unique index")
 
 
 def _capture_statements() -> tuple[list[str], object]:
@@ -44,6 +53,15 @@ def _migration_statements(statements: list[str]) -> list[str]:
         statement
         for statement in statements
         if statement.lstrip().lower().startswith(_MIGRATION_PREFIXES)
+    ]
+
+
+def _replayed_ddl(statements: list[str]) -> list[str]:
+    """The ALTER/CREATE INDEX statements the batch would replay."""
+    return [
+        statement
+        for statement in statements
+        if statement.lstrip().lower().startswith(_DDL_PREFIXES)
     ]
 
 
@@ -108,7 +126,41 @@ def test_existing_database_is_adopted_without_replaying_the_batch(client, unstam
     """
     statements = _init_db_capturing()
 
-    assert _migration_statements(statements) == [], (
-        "adoption must stamp the version, not re-run destructive work"
+    # Relaxed from "zero statements": adoption now runs the idempotent data
+    # fixups (`_DATA_FIXUPS`), which are UPDATEs. What must never be replayed
+    # is the schema work, whose `ALTER`s fail on an existing column.
+    assert _replayed_ddl(statements) == [], (
+        "adoption must stamp the version, not re-run destructive schema work"
     )
     assert _stamped_versions() == [SCHEMA_VERSION]
+
+
+def test_adoption_normalises_legacy_cancelled_jobs(client, unstamped):
+    """Adoption repairs legacy data even though it replays no schema work.
+
+    A pre-stamp database can hold rows written under the old job vocabulary:
+    `status='cancelled'` is not a terminal state in the contract (cancellation
+    is `failed` + `last_error='cancelled'`), and such a row would become
+    retryable. The previous code never ran this repair, so the adopt path must.
+    A legacy row that already carries a real message keeps it.
+    """
+    with SessionLocal() as db:
+        db.add(Job(kind="legacy", status="cancelled"))
+        db.add(Job(kind="legacy", status="cancelled", last_error="boom"))
+        db.commit()
+
+    statements = _init_db_capturing()
+
+    assert _replayed_ddl(statements) == [], "adoption replays no schema work"
+    assert any(
+        "update jobs" in statement.lower() for statement in statements
+    ), "adoption must run the data fixups"
+
+    with engine.connect() as conn:
+        rows = sorted(
+            (str(status), str(last_error))
+            for status, last_error in conn.execute(
+                text("select status, last_error from jobs")
+            )
+        )
+    assert rows == [("failed", "boom"), ("failed", "cancelled")]

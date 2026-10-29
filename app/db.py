@@ -47,8 +47,9 @@ class SchemaMigration(Base):
     )
 
 
-# Bump this whenever `_ADDED_COLUMNS` or `_ADDED_FOREIGN_KEYS` gains a step.
-# A database already stamped at this version skips the whole batch.
+# Bump this whenever `_ADDED_COLUMNS`, `_ADDED_FOREIGN_KEYS` or `_DATA_FIXUPS`
+# gains a step. A database already stamped at this version skips them all; the
+# adopt path runs the fixups anyway, so they stay safe to apply out of band.
 SCHEMA_VERSION = 2
 
 # Advisory-lock key for the migration. Follows the codebase's
@@ -96,15 +97,22 @@ def init_db() -> None:
 
         current = _current_schema_version(conn)
         if current >= SCHEMA_VERSION:
+            # Already at target: no DDL and no DML at all. The data fixups ran
+            # on the boot that stamped this version (or on adoption).
             return
         if current == 0 and _migration_already_applied(conn):
             # A database from before the stamp existed: the batch has already
             # been applied by the previous code, so adopt it without replaying
-            # any destructive work — just record where it stands.
+            # any destructive schema work (`_ADDED_COLUMNS`' `ALTER`s would
+            # fail on existing columns). The idempotent data repairs were never
+            # run by the old code — its last statement predates them — so run
+            # those, then record where it stands.
+            _run_data_fixups(conn)
             _record_schema_version(conn, SCHEMA_VERSION)
             return
 
         _run_migration_statements(conn)
+        _run_data_fixups(conn)
         _record_schema_version(conn, SCHEMA_VERSION)
 
 
@@ -222,6 +230,16 @@ _ADDED_COLUMNS = (
     "alter table videos add column if not exists drive_file_id varchar(255)",
     "alter table videos add column if not exists drive_link_id uuid",
     "create index if not exists ix_videos_drive_link_id on videos (drive_link_id)",
+    # One live drive link per (account, provider): enforced at the DB level so
+    # two concurrent connect requests cannot create duplicate rows.
+    "create unique index if not exists ix_drive_links_user_provider on drive_links (user_id, provider)",
+)
+
+# Idempotent *data* repairs, kept apart from `_ADDED_COLUMNS` so the adoption
+# path can run them without replaying that tuple's `ALTER`s, which would fail
+# on a column that already exists. Each one matches zero rows once applied, so
+# running them on an already-migrated database is free.
+_DATA_FIXUPS = (
     # Job cancellation is `failed` + `last_error = 'cancelled'` (see
     # `app/worker/queue.py`). No committed code writes a `status = 'cancelled'`
     # row, but one predates that convention and survives in a dev database:
@@ -232,20 +250,25 @@ _ADDED_COLUMNS = (
     "update jobs set status = 'failed',"
     " last_error = coalesce(nullif(last_error, ''), 'cancelled')"
     " where status = 'cancelled'",
-    # One live drive link per (account, provider): enforced at the DB level so
-    # two concurrent connect requests cannot create duplicate rows.
-    "create unique index if not exists ix_drive_links_user_provider on drive_links (user_id, provider)",
 )
+
+
+def _run_data_fixups(conn: Connection) -> None:
+    """Run the idempotent data repairs inside the caller's transaction."""
+    for statement in _DATA_FIXUPS:
+        conn.exec_driver_sql(statement)
 
 
 def _add_missing_columns() -> None:
     """Standalone entry point (manual repairs); the boot path runs the same
-    statements, plus the constraints, inside the gated migration transaction."""
+    statements, plus the constraints and data fixups, inside the gated
+    migration transaction."""
     if engine.dialect.name != "postgresql":
         return
     with engine.begin() as conn:
         for statement in _ADDED_COLUMNS:
             conn.exec_driver_sql(statement)
+        _run_data_fixups(conn)
 
 
 # Foreign keys added after the first release. `create_all` only creates a table
