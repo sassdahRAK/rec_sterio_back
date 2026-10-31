@@ -161,6 +161,11 @@ class Settings(BaseSettings):
     # Direct file upload (POST /videos/upload). Ingestion must not depend on a
     # platform's willingness to serve a download.
     max_upload_mb: int = 512
+    # A cloud upload row is created before any bytes exist (the client PUTs
+    # straight to the provider and calls `complete` afterwards). A day is long
+    # enough for a slow resumable transfer; past it the worker marks the row
+    # failed instead of leaving an `uploading` ghost forever.
+    cloud_upload_ttl_minutes: int = 1440
     # Largest accepted per-user cookies.txt upload (POST /bot-users/{id}/cookies).
     max_cookies_kb: int = 2048
 

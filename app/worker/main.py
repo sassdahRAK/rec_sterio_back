@@ -28,6 +28,15 @@ HEARTBEAT_MAX_INTERVAL_SECONDS = 30.0
 _heartbeat_thread: threading.Thread | None = None
 _heartbeat_lock = threading.Lock()
 
+# The poll loop runs every few seconds, but sweeping abandoned cloud uploads
+# does not need to: once every five minutes is enough to reclaim a row a day
+# old. Multiple worker threads share `_last_reap`, so a lock keeps only one of
+# them on the sweep. The race the lock prevents is a redundant UPDATE, not
+# corruption (the UPDATE is conditional), but the lock keeps the log honest.
+REAP_INTERVAL_SECONDS = 300.0
+_last_reap = 0.0
+_reap_lock = threading.Lock()
+
 
 def heartbeat_interval() -> float:
     """Seconds between heartbeat refreshes: never more than 30 s."""
@@ -87,6 +96,28 @@ def _install_signal_handlers() -> None:
             pass
 
 
+def _maybe_reap_stale_uploads() -> None:
+    """Run the abandoned-cloud-upload sweep at most once per REAP interval.
+
+    A failed sweep must never kill the poll loop: nothing else depends on it
+    (the upload stays `uploading` until a later pass succeeds), so log and
+    move on to claiming jobs.
+    """
+    global _last_reap
+    try:
+        now = time.monotonic()
+        with _reap_lock:
+            if now - _last_reap < REAP_INTERVAL_SECONDS:
+                return
+            _last_reap = now
+        with SessionLocal() as db:
+            reaped = queue.reap_stale_cloud_uploads(db)
+        if reaped:
+            logger.info("reaped %s abandoned cloud upload(s)", reaped)
+    except Exception:  # noqa: BLE001 - a sweep failure must not stop the worker
+        logger.exception("cloud upload sweep failed")
+
+
 def worker_loop(thread_name: str = "worker") -> None:
     global _last_heartbeat
     logger.info("worker %s started (poll=%.1fs)", thread_name, settings.worker_poll_seconds)
@@ -94,6 +125,7 @@ def worker_loop(thread_name: str = "worker") -> None:
         try:
             _last_heartbeat = time.time()
             heartbeat.write_heartbeat()
+            _maybe_reap_stale_uploads()
             with SessionLocal() as db:
                 job = queue.claim_job(db)
                 if job is None:

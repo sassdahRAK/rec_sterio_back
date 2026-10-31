@@ -14,7 +14,7 @@ from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.models import Job
+from app.models import Job, Video
 
 logger = logging.getLogger("recsterio.queue")
 
@@ -166,6 +166,55 @@ def claim_job(db: Session) -> Optional[Job]:
     db.commit()
     db.refresh(job)
     return job
+
+
+# What the contributor sees on a card whose bytes never arrived. Rendered
+# verbatim by the portal, so it stays a plain sentence.
+ABANDONED_CLOUD_UPLOAD_ERROR = (
+    "This upload was never completed. Start the upload again from Settings."
+)
+
+
+def reap_stale_cloud_uploads(
+    db: Session,
+    *,
+    now: Optional[datetime] = None,
+    ttl_minutes: Optional[int] = None,
+) -> int:
+    """Mark cloud uploads whose bytes never arrived as failed.
+
+    ``start_cloud_upload`` commits the Video row (status ``uploading``)
+    *before* the client PUTs to the provider and calls ``/complete``. If that
+    PUT never finishes (failed transfer, closed tab, dropped network) nothing
+    else ever touches the row, so it would sit ``uploading`` forever. This
+    mirrors ``claim_job``'s stale-run reclaim: a row older than the TTL
+    becomes terminal ``failed`` (never deleted, so the contributor still sees
+    what happened), and the conditional UPDATE makes a second pass a no-op.
+
+    Rows that already carry a ``drive_file_id`` are mid-completion and are
+    left alone; so are local (non-cloud) uploads and rows already terminal.
+    Returns the number of rows changed.
+    """
+    cutoff = (now or utcnow()) - timedelta(
+        minutes=ttl_minutes if ttl_minutes is not None else settings.cloud_upload_ttl_minutes
+    )
+    result = db.execute(
+        update(Video)
+        .where(
+            Video.status == "uploading",
+            Video.storage_backend.isnot(None),
+            Video.drive_file_id.is_(None),
+            Video.created_at < cutoff,
+        )
+        .values(
+            status="failed",
+            progress=0,
+            error=ABANDONED_CLOUD_UPLOAD_ERROR,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    db.commit()
+    return int(result.rowcount or 0)
 
 
 def touch_running(db: Session, job: Job) -> None:
