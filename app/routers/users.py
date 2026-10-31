@@ -91,6 +91,17 @@ def _is_root(user: Optional[AdminUser]) -> bool:
     return user is not None and root is not None and user.email == root
 
 
+def _user_out(user: AdminUser) -> AdminUserOut:
+    """Serialize one row, stamping the computed root flag.
+
+    `is_root` is not a column — the router is the only place that knows the
+    seed-email rule — so every AdminUserOut leaves through here.
+    """
+    out = AdminUserOut.model_validate(user)
+    out.is_root = _is_root(user)
+    return out
+
+
 def _root_locked(user: AdminUser) -> AppError:
     return AppError(
         403,
@@ -139,7 +150,7 @@ def list_users(
         .all()
     )
     return AdminUserListOut(
-        items=[AdminUserOut.model_validate(u) for u in users],
+        items=[_user_out(u) for u in users],
         total=total,
         page=page,
         page_size=page_size,
@@ -180,7 +191,7 @@ def create_user(
     db.add(user)
     db.commit()
     db.refresh(user)
-    return AdminUserOut.model_validate(user)
+    return _user_out(user)
 
 
 @router.patch("/{user_id}", response_model=AdminUserOut)
@@ -259,7 +270,7 @@ def update_user(
 
     db.commit()
     db.refresh(user)
-    return AdminUserOut.model_validate(user)
+    return _user_out(user)
 
 
 @router.delete("/me", status_code=204)

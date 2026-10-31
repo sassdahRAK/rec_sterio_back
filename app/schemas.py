@@ -178,6 +178,9 @@ class AdminUserOut(BaseModel):
     role: str
     is_active: bool
     telegram_user_id: Optional[int] = None
+    # Not a column: computed per row by the router from settings.ADMIN_EMAIL
+    # (see app.routers.users._is_root). Lets the console render the root lock.
+    is_root: bool = False
     created_at: UTCDateTime
 
 

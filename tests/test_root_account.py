@@ -210,6 +210,23 @@ def test_plain_accounts_are_still_fully_manageable(client, auth_headers):
     assert resp.status_code == 204, resp.text
 
 
+# ------------------------------------------------- the list says which row is root
+
+
+def test_the_users_list_flags_the_root_row(client, auth_headers, attacker):
+    """`is_root` is computed per row so the console can render the lock.
+
+    The flag mirrors the same `_is_root` the PATCH/DELETE guards use — only
+    the seed-email row is true; every other account, super admin included.
+    """
+    second, _ = attacker
+    resp = client.get(f"{API}/users", params={"page_size": 100}, headers=auth_headers)
+    assert resp.status_code == 200, resp.text
+    flags = {row["email"]: row["is_root"] for row in resp.json()["items"]}
+    assert flags[ADMIN_EMAIL] is True
+    assert flags[SECOND_SUPER] is False
+
+
 # ------------------------------------------------ POST cannot mint a second root
 
 
