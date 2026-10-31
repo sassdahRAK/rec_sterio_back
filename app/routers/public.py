@@ -232,6 +232,7 @@ def download_folder_zip(
 @router.get("/videos/{video_id}/thumbnail")
 def get_public_video_thumbnail(
     video_id: UUID,
+    t: Optional[str] = Query(default=None),
     db: Session = Depends(get_db),
     principal: Principal = Depends(get_optional_principal),
 ) -> FileResponse:
@@ -239,12 +240,20 @@ def get_public_video_thumbnail(
 
     Access is the same predicate the card builders apply: a folder the caller
     can read (public, or scoped by the passcode/share token they present) or,
-    for a portal-link token, the one unit it names. An unreadable video is a
-    plain 404, never a 403, so the answer cannot confirm that a private unit
-    exists. A readable video with no cached frame is a 404 too.
+    for a portal-link token, the one unit it names. A card in any other folder
+    carries the short-lived `?t=` token minted by
+    `thumbnail.public_thumbnail_url`, because an `<img src>` cannot send an
+    Authorization header. An unreadable video is a plain 404, never a 403, so
+    the answer cannot confirm that a private unit exists. A readable video with
+    no cached frame is a 404 too.
     """
     video = db.get(Video, video_id)
-    if video is None or video_role(db, video, principal) is None:
+    role = video_role(db, video, principal) if video is not None else None
+    # A token only ever unlocks an existing row: a correctly signed token for a
+    # deleted video must still answer the same 404 as any other missing unit.
+    if video is None or (
+        role is None and not thumbnail.verify_thumbnail_token(video_id, t)
+    ):
         # The wording and shape match every other "Video not found" in the API.
         raise AppError(404, "not_found", "Video not found.", [{"id": str(video_id)}])
     path = storage.thumbnail_file(video.id)
@@ -255,12 +264,22 @@ def get_public_video_thumbnail(
             "This video has no thumbnail yet.",
             [{"id": str(video_id)}],
         )
+    # Only a frame from a published folder may enter a shared cache. Everything
+    # else (token-authorized, or a private folder read by a signed-in caller)
+    # must stay out of it, so the branch follows the folder, never the mere
+    # presence of `t`. The bytes never change, hence the long immutable public
+    # cache; a private copy is short so it ages out with its token.
+    folder = db.get(Folder, video.folder_id) if video.folder_id is not None else None
+    is_public = folder is not None and folder.visibility == "public"
+    cache_control = (
+        "public, max-age=604800, immutable"
+        if is_public
+        else "private, max-age=3600"
+    )
     return FileResponse(
         path,
         media_type=storage.guess_mime(path),
-        # The bytes for a given id never change, and they no longer sit behind
-        # an expiring signature, so a long immutable cache is safe.
-        headers={"Cache-Control": "public, max-age=604800, immutable"},
+        headers={"Cache-Control": cache_control},
     )
 
 

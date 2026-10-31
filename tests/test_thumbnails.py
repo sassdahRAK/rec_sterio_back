@@ -101,14 +101,76 @@ def test_public_thumbnail_url_for_a_cached_public_video(client, auth_headers):
         assert public_thumbnail_url(row) == expected
 
 
-def test_public_thumbnail_url_keeps_the_cdn_for_a_private_folder(client, auth_headers):
+def test_public_thumbnail_url_signs_a_cached_private_folder(client, auth_headers):
     folder, video = _public_folder_and_video(client, auth_headers, visibility="private")
     _set_thumbnail_url(video["id"], CDN_URL)
     storage.save_thumbnail(video["id"], JPEG, "image/jpeg")
 
+    bare = f"/api/v1/public/videos/{video['id']}/thumbnail"
     with SessionLocal() as db:
         row = db.get(Video, UUID(video["id"]))
-        assert public_thumbnail_url(row) == CDN_URL
+        folder_row = db.get(Folder, UUID(folder["id"]))
+        discovered = public_thumbnail_url(row)
+        explicit = public_thumbnail_url(row, folder_row)
+
+    assert discovered == explicit
+    assert discovered.startswith(bare + "?t=")
+    token = discovered.split("?t=", 1)[1]
+    assert thumbnail_service.verify_thumbnail_token(video["id"], token)
+
+
+# ------------------------------------------------------------ URL token
+
+
+def test_thumbnail_token_roundtrips_and_is_video_scoped():
+    video_id = uuid4()
+    token = thumbnail_service.thumbnail_token(video_id)
+
+    assert thumbnail_service.verify_thumbnail_token(video_id, token)
+    # Same video, different id: the MAC is not transferable.
+    assert not thumbnail_service.verify_thumbnail_token(uuid4(), token)
+    # Tampered MAC, garbage, and absence are all rejected without raising.
+    bucket_part, _, mac = token.partition(".")
+    flipped = "0" if mac[0] != "0" else "1"
+    tampered = f"{bucket_part}.{flipped}{mac[1:]}"
+    assert tampered != token
+    assert not thumbnail_service.verify_thumbnail_token(video_id, tampered)
+    assert not thumbnail_service.verify_thumbnail_token(video_id, "garbage")
+    assert not thumbnail_service.verify_thumbnail_token(video_id, "abc.def")
+    assert not thumbnail_service.verify_thumbnail_token(video_id, "")
+    assert not thumbnail_service.verify_thumbnail_token(video_id, None)
+
+
+def test_thumbnail_token_is_stable_within_a_bucket(monkeypatch):
+    video_id = uuid4()
+    base = 1_000_000
+    monkeypatch.setattr(
+        thumbnail_service.time,
+        "time",
+        lambda: base * thumbnail_service.THUMBNAIL_TOKEN_TTL_SECONDS + 5,
+    )
+
+    assert thumbnail_service.thumbnail_token(video_id) == thumbnail_service.thumbnail_token(
+        video_id
+    )
+
+
+def test_thumbnail_token_survives_one_rollover(monkeypatch):
+    video_id = uuid4()
+    ttl = thumbnail_service.THUMBNAIL_TOKEN_TTL_SECONDS
+    bucket = 1_000_000
+
+    monkeypatch.setattr(thumbnail_service.time, "time", lambda: bucket * ttl + 10)
+    token = thumbnail_service.thumbnail_token(video_id)
+
+    # The next bucket still accepts it: a token minted seconds before the
+    # rollover must not break a card that is already on screen.
+    monkeypatch.setattr(thumbnail_service.time, "time", lambda: (bucket + 1) * ttl + 5)
+    assert thumbnail_service.verify_thumbnail_token(video_id, token)
+
+    # Two buckets later it is dead.
+    monkeypatch.setattr(thumbnail_service.time, "time", lambda: (bucket + 2) * ttl + 5)
+    assert not thumbnail_service.verify_thumbnail_token(video_id, token)
 
 
 # ------------------------------------------------------------------ endpoint
@@ -142,6 +204,35 @@ def test_thumbnail_endpoint_hides_a_private_video_from_anonymous(client, auth_he
     assert str(settings.media_root_path) not in text
     assert "thumbnail" not in text.lower()
     assert "storage" not in text.lower()
+
+
+def test_thumbnail_endpoint_serves_a_private_frame_with_a_token(client, auth_headers):
+    _, video = _public_folder_and_video(client, auth_headers, visibility="private")
+    storage.save_thumbnail(video["id"], PNG, "image/png")
+    token = thumbnail_service.thumbnail_token(video["id"])
+
+    resp = client.get(
+        f"/api/v1/public/videos/{video['id']}/thumbnail", params={"t": token}
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.content == PNG
+    # A token-authorized frame must never enter a shared cache.
+    assert resp.headers["cache-control"] == "private, max-age=3600"
+
+
+def test_thumbnail_endpoint_rejects_an_invalid_token(client, auth_headers):
+    _, video = _public_folder_and_video(client, auth_headers, visibility="private")
+    storage.save_thumbnail(video["id"], PNG, "image/png")
+
+    for bad in ("123.deadbeef", "garbage", ""):
+        resp = client.get(
+            f"/api/v1/public/videos/{video['id']}/thumbnail", params={"t": bad}
+        )
+        assert resp.status_code == 404
+        assert resp.json()["error"]["code"] == "not_found"
+        assert resp.json()["error"]["message"] == "Video not found."
+        assert str(settings.media_root_path) not in resp.text
 
 
 def test_thumbnail_endpoint_reports_a_missing_cache_without_leaking(client, auth_headers):

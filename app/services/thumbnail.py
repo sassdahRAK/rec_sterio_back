@@ -11,17 +11,21 @@ Nothing here may fail an ingest: every entry point returns None on error.
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import logging
 import mimetypes
 import shutil
 import tempfile
 import threading
+import time
 from pathlib import Path
 from typing import Any, Optional
 from uuid import UUID
 
 from sqlalchemy.orm import object_session
 
+from app.config import settings
 from app.errors import AppError
 from app.models import Folder
 from app.security import assert_fetch_url_safe
@@ -39,6 +43,13 @@ FETCH_USER_AGENT = (
 # The download path budgets `socket_timeout: 30` with 3 retries; a re-derive
 # that outlives that same budget is a failure, not something to wait on.
 DERIVE_TIMEOUT_SECONDS = 120.0
+
+# An `<img src>` cannot carry an Authorization header, so a private card needs
+# a credential in the URL itself. A JWT would embed `iat`/`exp` and therefore
+# produce a new URL on every poll, which defeats the browser cache. This token
+# is a pure function of (video, hour bucket) instead: it stays byte-identical
+# for an hour, and the window is small enough to rotate predictably.
+THUMBNAIL_TOKEN_TTL_SECONDS = 3600
 
 _IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
 
@@ -200,18 +211,72 @@ def _folder_for(video) -> Optional[Folder]:
     return db.get(Folder, video.folder_id)
 
 
+def _thumbnail_mac(video_id, bucket: int) -> str:
+    """The 32-hex-char MAC binding one video id to one time bucket."""
+    return hmac.new(
+        settings.secret_key.encode(),
+        f"thumb:{video_id}:{bucket}".encode(),
+        hashlib.sha256,
+    ).hexdigest()[:32]
+
+
+def thumbnail_token(video_id) -> str:
+    """A short-lived, video-scoped URL credential: `"<bucket>.<mac>"`.
+
+    Deterministic within the hour bucket, so repeated serialization of the
+    same card yields the same URL and the browser keeps the image cached.
+    This is deliberately not a JWT: `iat`/`exp` would churn the URL on every
+    poll.
+    """
+    bucket = int(time.time()) // THUMBNAIL_TOKEN_TTL_SECONDS
+    return f"{bucket}.{_thumbnail_mac(video_id, bucket)}"
+
+
+def verify_thumbnail_token(video_id, token: Optional[str]) -> bool:
+    """Whether `token` authorizes reading this video's cached frame.
+
+    The current bucket and the one immediately before it are both accepted,
+    so a token minted seconds before a rollover keeps working. Malformed
+    input is simply False; this never raises.
+    """
+    if not isinstance(token, str) or not token:
+        return False
+    raw_bucket, _, mac = token.partition(".")
+    if not raw_bucket or not mac:
+        return False
+    try:
+        bucket = int(raw_bucket)
+    except ValueError:
+        return False
+    current = int(time.time()) // THUMBNAIL_TOKEN_TTL_SECONDS
+    if bucket not in (current, current - 1):
+        return False
+    expected = _thumbnail_mac(video_id, bucket)
+    try:
+        return hmac.compare_digest(mac.encode("utf-8", "ignore"), expected.encode())
+    except TypeError:
+        return False
+
+
 def public_thumbnail_url(video, folder: Optional[Folder] = None) -> Optional[str]:
     """What a card's `thumbnail_url` should be.
 
-    The local endpoint wins only when a frame is cached AND the video sits in
-    a folder a visitor can read — the same test `public._public_tree` applies
-    (the folder itself is published). Everything else keeps the stored CDN
-    URL, so private rows behave exactly as they did before.
+    When a frame is cached the local endpoint wins in every case: the bare path
+    for a published folder, and a signed `?t=` path for any other folder
+    (private, passcode-reachable or share-reachable), because the platform CDN
+    URL expires and a private card would otherwise go blank.
+
+    The token is minted only here. This helper is called from serializers the
+    caller has already reached by reading the collection, so being asked to
+    describe a row is itself evidence that the row is readable; it must never
+    be wired into a code path that has not authorized the row first. With no
+    cached frame the stored CDN URL is returned unchanged.
     """
     if storage.thumbnail_file(video.id) is None:
         return video.thumbnail_url
     if folder is None:
         folder = _folder_for(video)
+    path = f"/api/v1/public/videos/{video.id}/thumbnail"
     if folder is not None and folder.visibility == "public":
-        return f"/api/v1/public/videos/{video.id}/thumbnail"
-    return video.thumbnail_url
+        return path
+    return f"{path}?t={thumbnail_token(video.id)}"
