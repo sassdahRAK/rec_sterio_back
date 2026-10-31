@@ -235,7 +235,7 @@ def _remote_name(filename: Optional[str], video_id: UUID) -> str:
     base = Path(filename or "upload").name or "upload"
     stem, dot, suffix = base.rpartition(".")
     safe_suffix = f".{suffix}" if dot and len(suffix) <= 8 else ""
-    return f"RecSterio/{video_id.hex[:12]}-{hashlib.sha1(str(video_id).encode()).hexdigest()[:8]}{safe_suffix}"
+    return f"{video_id.hex[:12]}-{hashlib.sha1(str(video_id).encode()).hexdigest()[:8]}{safe_suffix}"
 
 
 @router.post("/uploads", response_model=schemas.CloudUploadOut, status_code=201)
@@ -277,7 +277,12 @@ def start_cloud_upload(
     # Google Drive has no app-private folder for this scope: find (or create)
     # ours and use it as the upload's parent. Resolution is best-effort and
     # falls back to My Drive root; OneDrive's approot already isolates files.
-    target = cloud_providers.create_upload_target(payload.backend, access, remote, mime, declared_size)
+    parent_id = (
+        cloud_providers.ensure_app_folder(access) if payload.backend == "google" else None
+    )
+    target = cloud_providers.create_upload_target(
+        payload.backend, access, remote, mime, declared_size, parent_id=parent_id
+    )
     # The provider file id is known only after the bytes land; `complete` sets it.
     return schemas.CloudUploadOut(
         video_id=video.id,

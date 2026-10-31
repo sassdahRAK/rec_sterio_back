@@ -318,14 +318,18 @@ def test_the_super_admin_cannot_change_its_own_role_or_active_state(client, auth
         ).scalar_one()
         me_id = str(me.id)
 
+    # The seeded operator IS the root (its email is ADMIN_EMAIL), so the
+    # permanent-root lock answers before the plain self-guard would:
+    # 403 root_account_locked, not 422 (the 422 path is covered for a
+    # non-root super admin in tests/test_root_account.py).
     demote = client.patch(f"{API}/users/{me_id}", json={"role": "admin"}, headers=auth_headers)
-    assert demote.status_code == 422, demote.text
-    assert demote.json()["error"]["code"] == "self_modification_forbidden"
+    assert demote.status_code == 403, demote.text
+    assert demote.json()["error"]["code"] == "root_account_locked"
 
     deactivate = client.patch(
         f"{API}/users/{me_id}", json={"is_active": False}, headers=auth_headers
     )
-    assert deactivate.status_code == 422, deactivate.text
+    assert deactivate.status_code == 403, deactivate.text
 
     # The account still works and is still the owner.
     assert _login(client, ADMIN_EMAIL, ADMIN_PASSWORD).status_code == 200

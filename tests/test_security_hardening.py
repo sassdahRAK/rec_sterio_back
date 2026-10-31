@@ -825,8 +825,11 @@ def test_delete_me_anonymizes_revokes_and_keeps_videos(client):
 
 
 def test_delete_me_refuses_super_admin_and_the_bot(client):
-    # The super admin is the deployment's management surface.
-    assert client.delete(f"{API}/users/me", headers=operator()).status_code == 422
+    # The seeded super admin IS the root (email == ADMIN_EMAIL): the
+    # permanent-root lock answers with 403 before the plain self-guard's 422.
+    resp = client.delete(f"{API}/users/me", headers=operator())
+    assert resp.status_code == 403
+    assert resp.json()["error"]["code"] == "root_account_locked"
     # The bot service token is not an account row at all.
     bot_headers = {
         "Authorization": "Bearer test-bot-service-token",

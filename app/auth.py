@@ -182,6 +182,11 @@ def seed_admin_user(db: Session) -> Optional[AdminUser]:
     strand a deployment whose ADMIN_EMAIL was later pointed at an account
     created before the role system existed. Promotion is idempotent and never
     touches the password — rotating ADMIN_PASSWORD is an operator decision.
+
+    This seeded identity is also the deployment's permanent ROOT account:
+    `routers.users` matches it by normalized email (no DB column — the env
+    seed IS the root) and refuses to demote, deactivate or delete that row
+    for anyone, itself included (`403 root_account_locked`).
     """
     email = (settings.admin_email or "").strip().lower()
     password = settings.admin_password

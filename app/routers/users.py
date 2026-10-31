@@ -14,6 +14,16 @@ anonymizes the row, which is ALSO the revocation mechanism for the session
 token — every bearer token carries the (old) email as its `sub` claim, and
 principal resolution re-reads the row by that email on every request, so a
 token whose subject is now `deleted:{id}` simply fails to resolve.
+
+**The root account is locked.** One super admin — the row named by
+`settings.ADMIN_EMAIL`, which the bootstrap seed creates or promotes on every
+boot — is the deployment's permanent root: it can never be demoted,
+deactivated or deleted here, by anyone, including itself and other super
+admins (`403 root_account_locked`). The guard covers privilege fields only:
+the root may still rename itself and reset its own password, and renaming or
+resetting the root's password by another admin stays allowed, so the lock can
+never lock a real operator out of the account. See `_root_email` for why root is an
+identity-of-record, not a column.
 """
 from __future__ import annotations
 
@@ -57,6 +67,38 @@ def _user_or_404(db: Session, user_id: UUID) -> AdminUser:
     if user is None:
         raise AppError(404, "not_found", "No user with this id.", [{"id": str(user_id)}])
     return user
+
+
+def _root_email() -> Optional[str]:
+    """The root account's email, or None when no root is configured.
+
+    Root is deliberately NOT a database column: it is the `admin_users` row
+    whose email equals the normalized `settings.ADMIN_EMAIL` — exactly the
+    identity that `auth.seed_admin_user` creates or promotes to super_admin on
+    every boot. Because that promotion is idempotent and the email column is
+    unique, the root cannot be lost, duplicated, or permanently demoted —
+    the env seed IS the root identity, which is also the comparison the
+    self-delete folder-transfer below already makes. Rows store normalized
+    (lowercased) emails, both the seed and `UserCreateIn` go through it, so
+    a plain string compare is safe.
+    """
+    email = (settings.admin_email or "").strip().lower()
+    return email or None
+
+
+def _is_root(user: Optional[AdminUser]) -> bool:
+    root = _root_email()
+    return user is not None and root is not None and user.email == root
+
+
+def _root_locked(user: AdminUser) -> AppError:
+    return AppError(
+        403,
+        "root_account_locked",
+        "This is the deployment's root account. It can never be demoted, "
+        "deactivated or deleted, not even by another super admin.",
+        [{"id": str(user.id), "email": user.email}],
+    )
 
 
 @router.get("", response_model=AdminUserListOut)
@@ -151,10 +193,12 @@ def update_user(
     """Change a role, activate or deactivate, rename, or reset a password.
 
     The self-guard compares against the principal's own row id (not its email
-    string): the one account that must not be demoted or deactivated here is
-    the super admin doing the editing, or the deployment locks itself out of
-    its own management surface. Renaming yourself or resetting your own
-    password is fine.
+    string): the super admin doing the editing must not be able to demote or
+    deactivate itself, or the deployment locks itself out of its own
+    management surface. On top of that, the ROOT account (the row named by
+    `settings.ADMIN_EMAIL`) can never be demoted or deactivated by anyone,
+    including itself — `403 root_account_locked`. Renaming yourself or
+    resetting your own password is fine, for root too.
 
     A changed role takes effect on the target's NEXT request: roles are read
     from the database, not from the JWT (see `auth._resolve_principal`), so
@@ -187,6 +231,15 @@ def update_user(
         select(AdminUser).where(AdminUser.email == principal.email)
     ).scalar_one_or_none()
     touches_privilege = "role" in data or "is_active" in data
+
+    # The root lock comes FIRST and answers whoever the caller is: a second
+    # super admin demoting or deactivating the root is exactly the takeover
+    # the permanent-root rule exists to stop. Non-root self-modification
+    # keeps its own 422 below — different meaning (locking the *caller* out
+    # of the console), deliberately not merged into this one.
+    if touches_privilege and _is_root(user):
+        raise _root_locked(user)
+
     if touches_privilege and caller is not None and user.id == caller.id:
         raise AppError(
             422,
@@ -236,8 +289,9 @@ def delete_me(
     * dataset videos are kept for research integrity (a folder's videos
       stay with the folder, unfiled ones stay with their `created_by`
       attribution);
-    * a super admin (incl. the seeded operator) can never self-delete — it is
-      the deployment's management surface, mirroring the PATCH self-guard;
+    * the ROOT account (the row named by `settings.ADMIN_EMAIL`) can never
+      self-delete — `403 root_account_locked`, mirroring the PATCH root lock;
+      any other super admin is likewise refused, with the self-guard's 422;
     * nothing happens to the bot: the Telegram service identity is not an
       account row and cannot reach this route.
     """
@@ -254,6 +308,10 @@ def delete_me(
             "forbidden",
             "Sign in to a console account to delete it.",
         )
+    if _is_root(caller):
+        # Permanent root: no deletion, no exceptions, checked before the
+        # plain self-guard so the root is refused for the stronger reason.
+        raise _root_locked(caller)
     if caller.role == ROLE_SUPER_ADMIN:
         raise AppError(
             422,
