@@ -104,6 +104,23 @@ def _strongest(*roles: Optional[str]) -> Optional[str]:
     return best
 
 
+def masks_public_folders(principal: Principal) -> bool:
+    """Whether public visibility must be withheld from this caller.
+
+    A portal-link token names exactly one unit ("one video, cannot list"), so
+    public folders must not contribute visibility: otherwise the same
+    credential would read every public folder and enumerate the whole public
+    library through `GET /dataset/cards`, `GET /videos` and search. The grant
+    still reaches its own video — `video_role` short-circuits on
+    `scoped_video_ids` before any folder rule runs.
+
+    A folder-scoped (passcode/share) token carries an empty
+    `scoped_video_ids`, so it keeps public visibility unchanged; an account
+    token never carries the claim, and anonymous guests are empty too.
+    """
+    return principal.is_guest and bool(principal.scoped_video_ids)
+
+
 def folder_chain(db: Session, folder: Folder) -> list[Folder]:
     """The folder followed by its ancestors, root last."""
     chain: list[Folder] = []
@@ -122,7 +139,7 @@ def role_on_folder(
     """The caller's effective role on `folder`, or None when it is invisible.
 
     Resolution is the account role plus the per-folder walk, nothing else: the
-    admin tier and the Telegram service are editors everywhere; everyone else
+    admin tier and the bot's service identity are editors everywhere; everyone else
     starts from None and can only gain a role through a scoped token, public
     visibility, ownership or an explicit membership. The library tier
     (`developer`, `reviewer`) holds no implicit role on a folder — a private
@@ -130,17 +147,24 @@ def role_on_folder(
     """
     if principal.role in ADMIN_TIER:
         return "editor"
-    if principal.role == "telegram":
+    # Only the bot's own service identity is an editor everywhere. A person
+    # acting through the bot (`telegram:<uid>`) is resolved to their linked
+    # account role, or kept as an ordinary `telegram` principal with no blanket
+    # grant — otherwise knowing a folder id would read someone else's dataset.
+    if principal.is_bot_service:
         return "editor"
 
     if user is None:
         user = user_for(db, principal)
     role: Optional[str] = None
+    # A portal-link token must not inherit "viewer" from a public folder; its
+    # one video reaches this role through `video_role`'s scoped-id branch.
+    public_counts = not masks_public_folders(principal)
 
     for node in folder_chain(db, folder):
         if str(node.id) in principal.scoped_folder_ids:
             role = _strongest(role, principal.role_on(node.id) or "viewer")
-        if node.visibility == "public":
+        if public_counts and node.visibility == "public":
             role = _strongest(role, "viewer")
         if user is not None:
             if node.owner_id == user.id:
@@ -156,14 +180,14 @@ def visible_folders(db: Session, principal: Principal) -> dict[UUID, str]:
     """Every folder the caller can see, with the role they hold on it.
 
     One query for the folders, one for memberships — cheap for a whole page.
-    Everyone except the admin tier and the Telegram service gets only what the
-    per-folder rules grant: public visibility, ownership, an explicit
+    Everyone except the admin tier and the bot's service identity gets only
+    what the per-folder rules grant: public visibility, ownership, an explicit
     membership or a scoped token. The library tier is no different here — a
     private folder they hold no role on is absent, so the folder tree never
     leaks its existence or name.
     """
     folders = list(db.execute(select(Folder)).scalars())
-    if principal.role in ADMIN_TIER + ("telegram",):
+    if principal.role in ADMIN_TIER or principal.is_bot_service:
         return {f.id: "editor" for f in folders}
 
     user = user_for(db, principal)
@@ -177,6 +201,10 @@ def visible_folders(db: Session, principal: Principal) -> dict[UUID, str]:
         }
     by_id = {f.id: f for f in folders}
     out: dict[UUID, str] = {}
+    # The same suppression `role_on_folder` applies: a portal-link token names
+    # one video and must not see public folders in any listing (this map feeds
+    # `/dataset/cards`, `/videos` and the folder endpoints).
+    public_counts = not masks_public_folders(principal)
 
     for fid, folder in by_id.items():
         role: Optional[str] = None
@@ -186,7 +214,7 @@ def visible_folders(db: Session, principal: Principal) -> dict[UUID, str]:
             seen.add(current.id)
             if str(current.id) in principal.scoped_folder_ids:
                 role = _strongest(role, principal.role_on(current.id) or "viewer")
-            if current.visibility == "public":
+            if public_counts and current.visibility == "public":
                 role = _strongest(role, "viewer")
             if user is not None:
                 if current.owner_id == user.id:
@@ -204,10 +232,19 @@ def video_role(
     """The role the caller holds on a video (its folder decides, unless it is theirs)."""
     if principal.role in ADMIN_TIER:
         return "editor"
-    if principal.role == "telegram":
+    if principal.is_bot_service:
         return "editor"
     if video.created_by == principal.actor:
         return "editor"
+    # The portal-link grant is checked before the unfiled early return: that
+    # return is what made an unfiled bot-ingested unit invisible to the portal,
+    # and a scoped token is the one credential that may name such a unit. The
+    # role comes from the token's `video_roles` claim (viewer when absent) so
+    # the claim the issuer writes is the claim read back here. An id outside
+    # `scoped_video_ids` is still None — this never widens.
+    portal_role = principal.role_on_video(video.id)
+    if portal_role is not None:
+        return portal_role
     if video.folder_id is None:
         return None
     folder = db.get(Folder, video.folder_id)
@@ -309,7 +346,7 @@ def require_read(db: Session, folder: Folder, principal: Principal) -> str:
         raise AppError(
             404,
             "not_found",
-            "Folder not found. It may be private — sign in or unlock it with a passcode.",
+            "Folder not found. It may be private, so sign in or unlock it with a passcode.",
             [{"id": str(folder.id)}],
         )
     return role
@@ -347,7 +384,7 @@ def require_operator(principal: Principal) -> None:
     the operator — the console and the bot's admin-gated commands — and a
     member who can see one folder must not read the queue that serves them all.
     """
-    if principal.role not in (OPERATOR_ROLES + ("telegram",)):
+    if principal.role not in OPERATOR_ROLES and not principal.is_bot_service:
         raise AppError(
             403,
             "forbidden",

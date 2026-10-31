@@ -181,16 +181,35 @@ def _cleanup_cloud_temp(video: Video, media: Path) -> None:
 
 
 def _ensure_audio(db: Session, video: Video) -> Path:
-    """Make sure a 16 kHz mono wav exists for the video (idempotent)."""
+    """Make sure a 16 kHz mono wav exists for the video (idempotent).
+
+    The existing-audio check runs FIRST, before looking for media. A video
+    stored in the contributor's cloud has no local media once
+    `_cleanup_cloud_temp` has removed the transient `.cloud-tmp` copy, so a
+    media-first order made every chained transcribe job fail permanently even
+    though `audio.wav` (the correct ASR input) was already on disk.
+    """
+    audio = storage.audio_file(video.id)
+    if audio.exists() and audio.stat().st_size > 44:
+        # A stale cloud temp can still be present if extraction ran earlier
+        # but this job was retried before cleanup; drop it as before.
+        media = storage.find_media_file(video.id)
+        if media is not None:
+            _cleanup_cloud_temp(video, media)
+        return audio
     media = storage.find_media_file(video.id)
     if media is None:
+        # No audio and no media: only now is this genuinely unrecoverable.
+        # A cloud-backed video is expected to have no local media after
+        # extraction, so name the missing artifact that actually matters.
+        if video.storage_backend:
+            raise PermanentJobError(
+                "No extracted audio or local media found for this cloud-stored "
+                "video; re-run the download/extract step."
+            )
         raise PermanentJobError(
             "No downloaded media found for this video; the download job must run first."
         )
-    audio = storage.audio_file(video.id)
-    if audio.exists() and audio.stat().st_size > 44:
-        _cleanup_cloud_temp(video, media)
-        return audio
     try:
         asr_service.extract_audio(media, audio)
     except RuntimeError as exc:

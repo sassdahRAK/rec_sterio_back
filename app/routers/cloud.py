@@ -43,9 +43,9 @@ logger = logging.getLogger("recsterio.cloud")
 
 router = APIRouter(prefix="/cloud", tags=["cloud"])
 
-# Ingested files land in a dedicated app folder on the user's drive; this name
-# keeps them together and identifiable without touching the user's own files.
-REMOTE_APP_FOLDER = "RecSterio"
+# Ingested files land in a dedicated app folder on the user's drive; the name
+# lives in `cloud_providers`, which resolves/creates the folder and passes its
+# id as the upload's `parents` (never as part of the file name).
 
 
 def _verify_drive_file(provider: str, access_token: str, file_id: str) -> None:
@@ -187,14 +187,17 @@ def connect_drive(
     user = _user_for(principal, db)
     redirect_uri = _checked_redirect(payload.redirect_uri)
     grant = cloud_providers.exchange_code(payload.provider, payload.code, redirect_uri)
+    # Refuse before touching drive_links: a grant the user narrowed at the
+    # consent screen has no Drive access, so every later call would 403.
+    cloud_providers.verify_grant_scope(payload.provider, grant.scope)
     # One live link per (user, provider): reconnecting replaces the tokens.
     link = _link_for(user.id, payload.provider, db)
     if link is None:
         link = DriveLink(user_id=user.id, provider=payload.provider, account_email="", refresh_token="")
         db.add(link)
-    link.account_email = grant["account_email"]
-    link.account_subject = grant.get("account_subject")
-    link.refresh_token = encrypt_token(grant["refresh_token"])
+    link.account_email = grant.account_email
+    link.account_subject = grant.account_subject
+    link.refresh_token = encrypt_token(grant.refresh_token)
     db.commit()
     db.refresh(link)
     return schemas.DriveLinkOut(
@@ -222,11 +225,17 @@ def disconnect_drive(
 
 
 def _remote_name(filename: Optional[str], video_id: UUID) -> str:
+    """The real file name on the drive (no folder path).
+
+    The dedicated folder is a Drive `parents` entry; baking it into `name`
+    produced a flat file literally called "RecSterio/<hash>.mp4" in My Drive
+    root. A content hash prefix keeps names unique without exposing the uuid
+    twice.
+    """
     base = Path(filename or "upload").name or "upload"
     stem, dot, suffix = base.rpartition(".")
     safe_suffix = f".{suffix}" if dot and len(suffix) <= 8 else ""
-    # A content hash prefix keeps names unique without exposing the uuid twice.
-    return f"{REMOTE_APP_FOLDER}/{video_id.hex[:12]}-{hashlib.sha1(str(video_id).encode()).hexdigest()[:8]}{safe_suffix}"
+    return f"RecSterio/{video_id.hex[:12]}-{hashlib.sha1(str(video_id).encode()).hexdigest()[:8]}{safe_suffix}"
 
 
 @router.post("/uploads", response_model=schemas.CloudUploadOut, status_code=201)
@@ -265,6 +274,9 @@ def start_cloud_upload(
 
     access = cloud_providers.refresh_access_token(payload.backend, decrypt_token(link.refresh_token))
     remote = _remote_name(payload.filename, video.id)
+    # Google Drive has no app-private folder for this scope: find (or create)
+    # ours and use it as the upload's parent. Resolution is best-effort and
+    # falls back to My Drive root; OneDrive's approot already isolates files.
     target = cloud_providers.create_upload_target(payload.backend, access, remote, mime, declared_size)
     # The provider file id is known only after the bytes land; `complete` sets it.
     return schemas.CloudUploadOut(

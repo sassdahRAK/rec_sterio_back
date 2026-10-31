@@ -248,6 +248,53 @@ def test_an_unfiled_video_is_private_to_its_creator():
         assert video_role(db, _as(db, Video, vid), stranger) is None
 
 
+# ------------------------------------------- a Telegram person is not the bot
+#
+# `telegram:bot` is the service identity; `telegram:<uid>` is a person acting
+# through it. Both used to carry role "telegram", which granted editor
+# everywhere — so any Telegram user who knew a UUID could read and overwrite
+# another user's unit. These pin the narrowed rule: the person is an editor on
+# their own ingests and inherits folder visibility like any ordinary account.
+
+
+def test_a_telegram_person_is_an_editor_only_on_their_own_video():
+    mine = _video(folder_id=None, created_by="telegram:777001")
+    theirs = _video(folder_id=None, created_by="telegram:777002")
+    with SessionLocal() as db:
+        person = Principal("telegram:777001", "telegram", "777001")
+        assert video_role(db, _as(db, Video, mine), person) == "editor"
+        # The escalation regression: an unfiled unit owned by someone else is
+        # invisible to a plain telegram:<uid>, exactly as to a plain account.
+        assert video_role(db, _as(db, Video, theirs), person) is None
+
+
+def test_a_telegram_person_sees_public_folders_but_not_private_ones():
+    public = _folder(name="Public", visibility="public")
+    private = _folder(name="Private", visibility="private")
+    in_public = _video(folder_id=public, created_by="telegram:777002")
+    in_private = _video(folder_id=private, created_by="telegram:777002")
+    with SessionLocal() as db:
+        person = Principal("telegram:777001", "telegram", "777001")
+        assert video_role(db, _as(db, Video, in_public), person) == "viewer"
+        assert video_role(db, _as(db, Video, in_private), person) is None
+        # The folder tree agrees: only the public folder is listed.
+        assert private not in visible_folders(db, person)
+        assert public in visible_folders(db, person)
+
+
+def test_the_bot_service_identity_keeps_its_blanket_editor_grant():
+    private = _folder(name="Private", visibility="private")
+    unfiled = _video(folder_id=None, created_by="telegram:777002")
+    with SessionLocal() as db:
+        bot = Principal("telegram:bot", "telegram")
+        assert bot.is_bot_service is True
+        assert role_on_folder(db, _as(db, Folder, private), bot) == "editor"
+        assert video_role(db, _as(db, Video, unfiled), bot) == "editor"
+        # And the person form is never mistaken for the service one.
+        person = Principal("telegram:777001", "telegram", "777001")
+        assert person.is_bot_service is False
+
+
 # ---------------------------------------------------------------------- guards
 
 

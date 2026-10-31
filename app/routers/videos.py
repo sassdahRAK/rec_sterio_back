@@ -19,12 +19,17 @@ from app.access import (
     require_media_editor,
     require_operator,
     require_media_folder,
-    require_read,
     require_video,
     video_role,
     visible_folders,
 )
-from app.auth import Principal, get_actor, get_optional_principal, get_principal
+from app.auth import (
+    Principal,
+    get_actor,
+    get_optional_principal,
+    get_principal,
+    issue_portal_link_token,
+)
 from app.config import settings
 from app.db import get_db
 from app.errors import AppError
@@ -32,6 +37,7 @@ from app.models import DriveLink, Folder, Job, Merge, Transcript, Video
 from app.routers.bot_users import require_session_consent
 from app.schemas import (
     JobOut,
+    PortalLinkOut,
     TranscriptOut,
     VideoCopyIn,
     VideoCreate,
@@ -80,8 +86,11 @@ def _dedupe_scope(db: Session, principal: Principal):
     teammate re-pasting a link gets back the unit they can already open, and
     an unrelated user learns nothing about a private folder's contents.
     """
-    if principal.role == "telegram" and principal.actor == "telegram:bot":
+    if principal.is_bot_service:
         return None
+    # Reached only by an *unlinked* Telegram person: a linked uid now resolves
+    # to its account role above. Its scope is that person's own ingests plus
+    # public folders, never the whole library.
     if principal.role == "telegram":
         return _telegram_person_scope(db, principal)
     if principal.role in LIBRARY_VIEW_ROLES:
@@ -138,7 +147,7 @@ def _can_report_collision(db: Session, existing: Video, principal: Principal) ->
     open the video gets it echoed; anyone else gets a generic conflict. The
     Telegram service identity is the operator actor and keeps the full body.
     """
-    if principal.role == "telegram" and principal.actor == "telegram:bot":
+    if principal.is_bot_service:
         return True
     return video_role(db, existing, principal) is not None
 
@@ -187,7 +196,7 @@ def list_videos(
     # ingested themselves), so a folder's privacy is not merely cosmetic. The
     # library tiers' rows are additionally dropped from the page when the
     # caller could not open them — see the pagination branch below.
-    if principal.role not in LIBRARY_VIEW_ROLES + ("telegram",):
+    if principal.role not in LIBRARY_VIEW_ROLES and not principal.is_bot_service:
         roles = visible_folders(db, principal)
         conditions = [Video.created_by == principal.actor]
         if roles:
@@ -235,7 +244,7 @@ def list_videos(
     # plain user's scope already agrees with the check, so for them this only
     # removes a row should the two ever drift. The lists are small, so one pass
     # over them is fine.
-    if principal.role in ADMIN_TIER + ("telegram",):
+    if principal.role in ADMIN_TIER or principal.is_bot_service:
         total = db.execute(count_stmt).scalar_one()
         items = db.execute(
             stmt.offset((page - 1) * page_size).limit(page_size)
@@ -720,13 +729,74 @@ def get_video(
     # control and the worker both depend on the raw string.
     out.created_by_display = display_name(db, video.created_by)
     out.collected_by_display = display_name(db, video.collected_by)
-    # Job history is operational: only signed-in users see the queue internals.
-    if principal.is_signed_in or principal.role == "telegram":
+    # Job history is operational: only signed-in users and the bot's own
+    # service identity see the queue internals. A person acting through the
+    # bot does not — they may own the unit without being an operator.
+    if principal.is_signed_in or principal.is_bot_service:
         jobs = db.execute(
             select(Job).where(Job.video_id == video_id).order_by(Job.created_at.desc())
         ).scalars().all()
         out.jobs = [JobOut.model_validate(j) for j in jobs]
     return out
+
+
+@router.post("/{video_id}/portal-link", response_model=PortalLinkOut)
+def create_portal_link(
+    video_id: UUID,
+    db: Session = Depends(get_db),
+    principal: Principal = Depends(get_principal),
+) -> PortalLinkOut:
+    """Mint the signed, single-video link the bot puts behind its portal button.
+
+    The bot ingests what a Telegram user pastes *unfiled*, owned by
+    `telegram:<uid>`. No folder rule can make such a unit readable to the
+    portal, so the bot asks for a token that names exactly this one id. The
+    token is the app's ordinary JWT with `role="guest"` and a `videos` scope;
+    it reads the unit and its live progress, nothing else, and expires after
+    `PORTAL_LINK_TTL_DAYS`. Issuing is a pure signing operation — no database
+    row is written, so handing out links does not grow the schema.
+
+    Two callers may mint: an operator, or the Telegram user the unit belongs
+    to. The bot ingests as `created_by = telegram:<uid>` and names that user
+    with `X-Requested-By`, so "my own unit" is exactly the `created_by`
+    comparison below.
+    """
+    video = get_video_or_404(db, video_id)
+    # `video_role()` is deliberately NOT used for this decision: it answers a
+    # folder/creator role (and "editor" for the bot service identity), which is
+    # right for reading library rows but would let any Telegram user mint a
+    # link for anyone's UUID by naming it here. So the ownership test is the
+    # explicit `created_by` comparison: the row must have been ingested by the
+    # same `telegram:<uid>` that the bot put in `X-Requested-By`.
+    #
+    # The ACTOR is what identifies a Telegram person, not the role: linking a
+    # console account rewrites the resolved role to the account's (`user`,
+    # `reviewer`, ...) while the actor stays `telegram:<uid>`, and the actor is
+    # the stable ownership key `created_by` stores. Testing the role would lock
+    # every linked user out of their own bot-ingested unit; a linked account
+    # that happens to be admin still admits through the operator branch above.
+    #
+    # The bare service principal `telegram:bot` (bot token, no header) is
+    # refused on purpose: every mint must name the end user, so a handler that
+    # forgets the header fails closed instead of handing out arbitrary links.
+    is_own_telegram_unit = (
+        principal.actor.startswith("telegram:")
+        and principal.actor != "telegram:bot"
+        and video.created_by == principal.actor
+    )
+    if principal.role not in ADMIN_TIER and not is_own_telegram_unit:
+        raise AppError(
+            403,
+            "forbidden",
+            "Only an admin or the Telegram user who owns this video can create portal links.",
+            [{"role": principal.role}],
+        )
+    token, expires = issue_portal_link_token(video_id)
+    return PortalLinkOut(
+        token=token,
+        expires_at=expires,
+        path=f"/video/{video_id}?t={token}",
+    )
 
 
 @router.patch("/{video_id}", response_model=VideoOut)
@@ -1036,22 +1106,29 @@ def _parse_range(header: str, size: int) -> tuple[int, int]:
     return start, end
 
 
-def _authorize_media(db: Session, video: Video, principal) -> None:
-    """Gate media on the folder it lives in, not just on knowing the UUID.
+def _range_length(content_range: str) -> Optional[int]:
+    """Byte length of a `bytes <start>-<end>/<total>` Content-Range, else None."""
+    try:
+        span = content_range.split(" ", 1)[1].split("/", 1)[0]
+        start, end = span.split("-", 1)
+        return int(end) - int(start) + 1
+    except (IndexError, ValueError):
+        return None
 
-    The public portal serves cards from folders, so a video's media is as
-    public as its folder. An unfiled video has no folder, so it belongs to
-    whoever ingested it — `video_role` applies the creator rule that
-    `GET /videos/{id}` already uses. Letting any signed-in member through here
-    made media and audio wider than the metadata for the same resource.
+
+def _authorize_media(db: Session, video: Video, principal) -> None:
+    """Gate media on `video_role` — the same predicate the metadata routes use.
+
+    Media must be exactly as readable as `GET /videos/{id}`: the folder rule,
+    the creator rule for an unfiled unit, and the portal-link scope. Checking
+    only the folder made a scoped token's own filed unit 404 on its bytes, even
+    though its card and detail resolved; `video_role` knows every grant, so
+    routing through it lets the one named video stream while any other stays
+    as private as its folder. The 404 (not 403) is deliberate: whether media
+    exists for a unit the caller may not read is not theirs to learn.
     """
-    if video.folder_id is None:
-        if video_role(db, video, principal) is None:
-            raise AppError(404, "not_found", "Media is not available yet for this video.")
-        return
-    folder = db.get(Folder, video.folder_id)
-    if folder is not None:
-        require_read(db, folder, principal)
+    if video_role(db, video, principal) is None:
+        raise AppError(404, "not_found", "Media is not available yet for this video.")
 
 
 def _open_cloud_stream(
@@ -1073,7 +1150,7 @@ def _open_cloud_stream(
         raise AppError(
             404,
             "cloud_file_unavailable",
-            "The file is not available — reconnect your drive to restore access.",
+            "The file is not available. Reconnect your drive to restore access.",
         ) from exc
     try:
         read = cloud_providers.open_download(
@@ -1082,31 +1159,41 @@ def _open_cloud_stream(
     except AppError:
         raise
 
+    def provider_header(name: str) -> Optional[str]:
+        # `CloudRead.headers` may come back lowercase (httpx normalises keys),
+        # so every lookup here has to be case-insensitive.
+        target = name.lower()
+        for key, value in read.headers.items():
+            if key.lower() == target:
+                return value
+        return None
+
+    provider_range = provider_header("Content-Range")
+    provider_length = provider_header("Content-Length")
     headers: dict[str, str] = {
-        "Accept-Ranges": "bytes",
+        "Accept-Ranges": provider_header("Accept-Ranges") or "bytes",
         "Content-Disposition": f'inline; filename="{video.drive_file_id}"',
     }
-    # Forward Content-Range from provider (present on 206 responses)
-    if "Content-Range" in read.headers:
-        headers["Content-Range"] = read.headers["Content-Range"]
-    # Compute correct Content-Length
-    if read.status == 206 and "Content-Range" in read.headers:
-        # Parse partial length from Content-Range: bytes start-end/total
-        try:
-            range_part = read.headers["Content-Range"].split(" ", 1)[1]
-            byte_range = range_part.split("/")[0]
-            start, end = byte_range.split("-")
-            headers["Content-Length"] = str(int(end) - int(start) + 1)
-        except Exception:  # noqa: BLE001
-            if read.size:
-                headers["Content-Length"] = str(read.size)
+    if read.status == 206 and provider_range:
+        # Mirror `_serve_local_media`: the provider's exact Content-Range and
+        # the *ranged* length, never the file's total size.
+        headers["Content-Range"] = provider_range
+        ranged_length = _range_length(provider_range)
+        if ranged_length is not None:
+            headers["Content-Length"] = str(ranged_length)
+        elif provider_length:
+            headers["Content-Length"] = provider_length
+    elif provider_length:
+        headers["Content-Length"] = provider_length
     elif read.size:
         headers["Content-Length"] = str(read.size)
 
     return StreamingResponse(
         read.body,
         status_code=read.status,
-        media_type=read.headers.get("Content-Type", video.mime_type or "application/octet-stream"),
+        media_type=provider_header("Content-Type")
+        or video.mime_type
+        or "application/octet-stream",
         headers=headers,
     )
 

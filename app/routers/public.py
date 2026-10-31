@@ -22,7 +22,13 @@ from fastapi.responses import FileResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.access import can_read_folder, folder_or_404, require_read, role_on_folder
+from app.access import (
+    can_read_folder,
+    folder_or_404,
+    masks_public_folders,
+    require_read,
+    role_on_folder,
+)
 from app.auth import Principal, get_optional_principal, issue_folder_token
 from app.config import settings
 from app.db import get_db
@@ -150,6 +156,12 @@ def list_public_folders(
     principal: Principal = Depends(get_optional_principal),
 ) -> PublicFolderListOut:
     """Public folders, plus any private folder the caller holds a token for."""
+    # A portal-link token names one video and cannot list (the same rule
+    # `visible_folders` applies). This tree embeds each folder's cards, so
+    # without this the public library would still be enumerable through it.
+    # Anonymous and folder-scoped callers are untouched.
+    if masks_public_folders(principal):
+        return PublicFolderListOut(items=[], total=0)
     folders = _visible_public_folders(db)
     if principal.is_guest and principal.scoped_folder_ids:
         scoped_roots = db.execute(

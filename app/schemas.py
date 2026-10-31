@@ -788,6 +788,19 @@ class ShareRedeem(BaseModel):
     device_key: Optional[str] = None
 
 
+class PortalLinkOut(BaseModel):
+    """The signed single-video link the bot appends to its portal button.
+
+    The token is the ordinary app JWT (role "guest", scoped to one video), so
+    the portal sends it exactly as it sends any other bearer token; `path` is
+    the ready-to-append URL so the bot never assembles the query string itself.
+    """
+
+    token: str
+    expires_at: UTCDateTime
+    path: str
+
+
 class GuestTokenResponse(BaseModel):
     """A scoped bearer token plus the human-readable way it was obtained."""
 
@@ -812,6 +825,11 @@ class DataCardOut(BaseModel):
     title: Optional[str] = None
     source_url: Optional[str] = None
     status: str
+    # Live download/transcribe progress (0–100) and the last failure message.
+    # The portal's per-video page shows a unit before it is finished, so it
+    # needs the same two numbers the console's video object carries.
+    progress: int = 0
+    error: Optional[str] = None
     duration_seconds: Optional[float] = None
     thumbnail_url: Optional[str] = None
     folder_id: Optional[UUID] = None

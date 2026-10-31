@@ -53,15 +53,19 @@ def create_access_token(
     folder_ids: Optional[list] = None,
     ttl_minutes: Optional[int] = None,
     folder_roles: Optional[dict] = None,
+    video_ids: Optional[list] = None,
+    video_roles: Optional[dict] = None,
 ) -> tuple[str, datetime]:
     """Issue a bearer token.
 
     `role` is an account role from `app.roles`, or 'guest'. A guest token
     carries `folders` — the only folders it may read — and the role it was
     granted on each, so a passcode or share link grants exactly the access it
-    was created for and nothing else. For account tokens the claim is
-    informational: `_resolve_principal` re-reads the role from the database,
-    so a stale claim can never widen what the row allows.
+    was created for and nothing else. A portal-link token carries `videos`
+    instead: the one unit the bot's button opens, and the viewer role on it.
+    For account tokens both claims are informational: `_resolve_principal`
+    re-reads the role from the database and ignores these scopes, so a stale
+    claim can never widen what the row allows.
     """
     minutes = settings.access_token_ttl_minutes if ttl_minutes is None else ttl_minutes
     now = datetime.now(timezone.utc)
@@ -71,6 +75,8 @@ def create_access_token(
         "role": role,
         "folders": [str(f) for f in (folder_ids or [])],
         "roles": {str(k): str(v) for k, v in (folder_roles or {}).items()},
+        "videos": [str(v) for v in (video_ids or [])],
+        "video_roles": {str(k): str(v) for k, v in (video_roles or {}).items()},
         "iat": now,
         "exp": expires,
     }
@@ -110,6 +116,24 @@ def issue_folder_token(
         folder_ids=[folder_id],
         folder_roles={folder_id: role},
         ttl_minutes=settings.guest_ttl_minutes,
+    )
+
+
+def issue_portal_link_token(video_id: uuid.UUID) -> tuple[str, datetime]:
+    """A token scoped to exactly one video — the bot's "Open in portal" link.
+
+    A video pasted to the bot is ingested *unfiled* and owned by the
+    `telegram:<uid>` actor, so no folder rule can make it readable to the
+    portal. This token names that single unit instead, which lets the portal
+    show its live progress without opening the rest of the library. It expires
+    on its own so a link forwarded out of the chat does not stay valid.
+    """
+    return create_access_token(
+        f"guest:{uuid.uuid4().hex[:12]}",
+        role="guest",
+        video_ids=[video_id],
+        video_roles={video_id: "viewer"},
+        ttl_minutes=settings.portal_link_ttl_days * 24 * 60,
     )
 
 
@@ -189,7 +213,7 @@ def seed_admin_user(db: Session) -> Optional[AdminUser]:
 
 @dataclass(frozen=True)
 class Principal:
-    """Who is calling, and which folders a scoped token lets them see."""
+    """Who is calling, and which folders/videos a scoped token lets them see."""
 
     actor: str
     role: str
@@ -197,6 +221,10 @@ class Principal:
     scoped_folder_ids: frozenset = frozenset()
     # folder id -> role granted by the passcode / share link that issued the token
     scoped_roles: Mapping[str, str] = field(default_factory=dict)
+    # video ids granted by a portal-link token — exactly the unit it names
+    scoped_video_ids: frozenset = frozenset()
+    # video id -> role granted by that token (`video_roles` claim)
+    scoped_video_roles: Mapping[str, str] = field(default_factory=dict)
 
     @property
     def is_signed_in(self) -> bool:
@@ -206,11 +234,25 @@ class Principal:
     def is_guest(self) -> bool:
         return self.role == "guest"
 
+    @property
+    def is_bot_service(self) -> bool:
+        """The bot's own service identity, not a person acting through it."""
+        return self.role == "telegram" and self.actor == "telegram:bot"
+
     def can_access(self, folder_id) -> bool:
         return str(folder_id) in self.scoped_folder_ids
 
     def role_on(self, folder_id) -> Optional[str]:
         return self.scoped_roles.get(str(folder_id))
+
+    def role_on_video(self, video_id) -> Optional[str]:
+        # Reads the `video_roles` claim the issuer wrote, defaulting to viewer
+        # when an id is scoped without an explicit role (the same default
+        # `role_on` uses for folders). An id outside `scoped_video_ids` is
+        # None: the claim can name a role, never a scope it does not hold.
+        if str(video_id) not in self.scoped_video_ids:
+            return None
+        return self.scoped_video_roles.get(str(video_id), "viewer")
 
 
 def actor_role(actor: str) -> str:
@@ -238,6 +280,30 @@ def _resolve_principal(
             and settings.bot_api_token
             and token == settings.bot_api_token
         ):
+            uid = actor.split(":", 1)[1]
+            # A linked, active console account is resolved server-side and its
+            # role wins: a person acting through the bot must not inherit the
+            # `telegram` pseudo-role's blanket editor grant. The role is read
+            # from the row on every request (never from a claim), so a link
+            # change or deactivation applies immediately, exactly like a
+            # bearer-token account.
+            #
+            # `actor` must stay EXACTLY `telegram:<uid>`: `video.created_by`
+            # stores that string and `video_role`/`_dedupe_scope` compare it by
+            # equality, so rewriting it to `<role>:<email>` would orphan every
+            # unit the user ingested. Only the role (and the display email)
+            # change; the actor is the stable ownership key.
+            if uid.isdigit():
+                linked = db.execute(
+                    select(AdminUser).where(
+                        AdminUser.telegram_user_id == int(uid),
+                        AdminUser.is_active.is_(True),
+                    )
+                ).scalar_one_or_none()
+                if linked is not None:
+                    return Principal(
+                        actor=f"telegram:{uid}", role=linked.role, email=linked.email
+                    )
             return Principal(actor, actor_role(actor), actor.split(":", 1)[1] or None)
 
     # Service token for the Telegram bot.
@@ -260,8 +326,16 @@ def _resolve_principal(
             f"guest:{sub}",
             "guest",
             None,
-            frozenset(payload.get("folders") or []),
-            dict(payload.get("roles") or {}),
+            scoped_folder_ids=frozenset(payload.get("folders") or []),
+            scoped_roles=dict(payload.get("roles") or {}),
+            # `videos` is read only for guest tokens, exactly like `folders`:
+            # an account token's claim is not trusted as a scope.
+            scoped_video_ids=frozenset(
+                str(v) for v in (payload.get("videos") or [])
+            ),
+            # The per-video role is read back by `role_on_video`: the claim is
+            # what `video_role` reports, not a hardcoded "viewer".
+            scoped_video_roles=dict(payload.get("video_roles") or {}),
         )
 
     # An account token is resolved against the database, which is the role's

@@ -28,11 +28,14 @@ logger = logging.getLogger("recsterio.cloud")
 __all__ = [
     "PROVIDER_NAMES",
     "CloudAuthError",
+    "CloudGrant",
     "UploadTarget",
     "CloudRead",
     "providers_available",
     "exchange_code",
+    "verify_grant_scope",
     "refresh_access_token",
+    "ensure_app_folder",
     "create_upload_target",
     "open_download",
     "encrypt_token",
@@ -42,6 +45,7 @@ __all__ = [
 # Overridable in tests so the suite never reaches the real providers.
 GOOGLE_OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GOOGLE_USERINFO_URL = "https://openidconnect.googleapis.com/v1/userinfo"
+GOOGLE_FILES_URL = "https://www.googleapis.com/drive/v3/files"
 GOOGLE_UPLOAD_SESSION_URL = "https://www.googleapis.com/upload/drive/v3/files"
 GOOGLE_DOWNLOAD_URL = "https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"
 MICROSOFT_OAUTH_TOKEN_URL = "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
@@ -51,6 +55,12 @@ MICROSOFT_GRAPH_DOWNLOAD_URL = "https://graph.microsoft.com/v1.0/me/drive/items/
 
 # drive.file: only files THIS APP created — cannot read/write the user's other files.
 DRIVE_FILE_SCOPE = "https://www.googleapis.com/auth/drive.file"
+
+# The one folder this app owns in a contributor's Drive. With drive.file the
+# app only sees files it created, so this name cannot collide with a folder
+# the user made themselves, and looking it up is safe.
+GOOGLE_APP_FOLDER_NAME = "RecSterio"
+GOOGLE_FOLDER_MIME = "application/vnd.google-apps.folder"
 
 # Files.ReadWrite.AppFolder: read/write scoped to the app's own isolated folder
 # (approot / 'special folder'). Microsoft's approot special folder isolates
@@ -221,7 +231,7 @@ def decrypt_token(stored: str) -> str:
             raise AppError(
                 401,
                 "cloud_auth_rejected",
-                "Drive token integrity check failed — reconnect your drive.",
+                "Drive token integrity check failed. Reconnect your drive.",
             ) from exc
     legacy = _legacy_decrypt(raw)
     if legacy is not None:
@@ -232,7 +242,7 @@ def decrypt_token(stored: str) -> str:
     raise AppError(
         401,
         "cloud_auth_rejected",
-        "This drive's stored token cannot be decrypted — reconnect your drive.",
+        "This drive's stored token cannot be decrypted. Reconnect your drive.",
     )
 
 
@@ -241,6 +251,81 @@ class CloudAuthError(AppError):
 
     def __init__(self, message: str):
         super().__init__(400, "cloud_auth_rejected", message)
+
+
+@dataclass(frozen=True)
+class CloudGrant:
+    """What a successful authorization-code exchange actually yielded.
+
+    `scope` is the provider's own record of what the user consented to, exactly
+    as the token endpoint returned it (space-separated). Google reports it on
+    every code exchange; Microsoft's v2.0 token endpoint reports the granted
+    Graph scopes (short names). `None` means the provider did not include the
+    field — see `verify_grant_scope` for how that is treated.
+    """
+
+    refresh_token: str
+    account_email: str
+    account_subject: Optional[str] = None
+    scope: Optional[str] = None
+
+
+def verify_grant_scope(provider: str, scope: Optional[str]) -> None:
+    """Reject a grant that lacks the scope this app needs to work at all.
+
+    The consent screen lets the user uncheck the Drive / app-folder permission,
+    and the provider then issues a perfectly valid token that answers 403
+    `ACCESS_TOKEN_SCOPE_INSUFFICIENT` on every Drive call. Before this check
+    existed the connect still stored the link and reported "Connected", and the
+    failure only surfaced as a 502 on the first upload. Failing at connect time
+    keeps the useless grant out of `drive_links` and tells the user to reconnect.
+
+    A token response with no `scope` field at all is allowed with a warning:
+    some tenants omit it, and the old behaviour (trust the grant) is the safer
+    default than refusing every connect on such a tenant.
+    """
+    granted = [s for s in (scope or "").split() if s]
+    if not granted:
+        logger.warning(
+            "%s token response carried no scope; cannot verify the %s grant at "
+            "connect time — trusting the requested consent",
+            provider,
+            "drive.file" if provider == "google" else "Files.ReadWrite.AppFolder",
+        )
+        return
+
+    if provider == "google":
+        required = DRIVE_FILE_SCOPE
+        missing = required not in granted
+        message = (
+            "Google Drive permission was not granted. The Google consent screen "
+            f"must include the Drive scope (`{DRIVE_FILE_SCOPE}`); reconnect and "
+            "allow access to Drive."
+        )
+    else:
+        required = "Files.ReadWrite.AppFolder"
+        # Microsoft returns the short Graph name in the token response; some
+        # tenants echo the full https://graph.microsoft.com/... URL instead.
+        missing = not any(s.rstrip("/").endswith(required) for s in granted)
+        message = (
+            "OneDrive permission was not granted. The OneDrive consent screen "
+            f"must include the `{required}` scope; reconnect and allow access to "
+            "the app folder."
+        )
+
+    if missing:
+        raise AppError(
+            400,
+            "drive_scope_missing",
+            message,
+            [
+                {
+                    "provider": provider,
+                    "granted_scopes": granted,
+                    "missing_scope": required,
+                }
+            ],
+        )
 
 
 # --------------------------------------------------------------------- oauth
@@ -273,18 +358,20 @@ def _require_refresh(token: Dict[str, Any], provider: str) -> str:
     refresh = token.get("refresh_token")
     if not refresh:
         raise CloudAuthError(
-            f"{provider} returned no refresh token — request the consent with "
+            f"{provider} returned no refresh token. Request the consent with "
             "'access_type=offline' / 'prompt=consent' so the grant is renewable."
         )
     return refresh
 
 
-def exchange_code(provider: str, code: str, redirect_uri: str) -> Dict[str, Any]:
+def exchange_code(provider: str, code: str, redirect_uri: str) -> CloudGrant:
     """Trade the provider's authorization code for a renewable grant.
 
-    Returns {refresh_token, account_email, account_subject?}. The caller stores
-    the refresh token; the access token is used once here (to read the account
-    identity) and then discarded.
+    Returns a `CloudGrant` carrying the refresh token, the account identity and
+    the granted `scope` string the provider reported. The caller stores the
+    refresh token; the access token is used once here (to read the account
+    identity) and then discarded. The scope is not a secret and is what lets
+    the caller refuse a consent that omitted Drive access.
     """
     if provider == "google":
         g_id = settings.drive_google_client_id or settings.google_client_id
@@ -309,11 +396,12 @@ def exchange_code(provider: str, code: str, redirect_uri: str) -> Dict[str, Any]
         email = (info.get("email") or "").strip().lower()
         if not email:
             raise CloudAuthError("Google returned no account email.")
-        return {
-            "refresh_token": _require_refresh(token, "Google"),
-            "account_email": email,
-            "account_subject": str(info.get("sub") or "") or None,
-        }
+        return CloudGrant(
+            refresh_token=_require_refresh(token, "Google"),
+            account_email=email,
+            account_subject=str(info.get("sub") or "") or None,
+            scope=_scope_of(token),
+        )
 
     if not settings.onedrive_client_id or not settings.onedrive_client_secret:
         raise AppError(400, "provider_not_configured", "OneDrive storage is not configured on this server.")
@@ -336,11 +424,20 @@ def exchange_code(provider: str, code: str, redirect_uri: str) -> Dict[str, Any]
     email = (me.get("userPrincipalName") or me.get("mail") or "").strip().lower()
     if not email:
         raise CloudAuthError("OneDrive returned no account email.")
-    return {
-        "refresh_token": _require_refresh(token, "OneDrive"),
-        "account_email": email,
-        "account_subject": str(me.get("id") or "") or None,
-    }
+    return CloudGrant(
+        refresh_token=_require_refresh(token, "OneDrive"),
+        account_email=email,
+        account_subject=str(me.get("id") or "") or None,
+        scope=_scope_of(token),
+    )
+
+
+def _scope_of(token: Dict[str, Any]) -> Optional[str]:
+    """The provider's `scope` string, normalised to a string or None."""
+    scope = token.get("scope")
+    if scope is None:
+        return None
+    return str(scope)
 
 
 def refresh_access_token(provider: str, refresh_token: str) -> str:
@@ -390,6 +487,84 @@ def _bearer(access_token: str) -> Dict[str, str]:
     return {"Authorization": f"Bearer {access_token}"}
 
 
+def _drive_literal(value: str) -> str:
+    """Quote a value for a Drive `q=` expression (escape backslashes/quotes)."""
+    return value.replace("\\", "\\\\").replace("'", "\\'")
+
+
+def ensure_app_folder(
+    access_token: str,
+    folder_name: str = GOOGLE_APP_FOLDER_NAME,
+) -> Optional[str]:
+    """Find, or create once, the app-owned folder in the user's Drive.
+
+    Returns the folder id, or `None` when it cannot be resolved. Never raises:
+    an upload that lands in My Drive root is much better than an upload that
+    fails because a folder lookup hiccuped. The caller then omits `parents`.
+
+    `drive.file` only shows files this app created, so the name lookup cannot
+    match (or later touch) a folder the user made themselves.
+    """
+    if not access_token:
+        return None
+    try:
+        query = (
+            f"mimeType='{GOOGLE_FOLDER_MIME}' and name='{_drive_literal(folder_name)}' "
+            "and trashed=false"
+        )
+        params = _urlparse.urlencode(
+            {
+                "q": query,
+                "spaces": "drive",
+                "fields": "files(id,name)",
+                "pageSize": 1,
+            }
+        )
+        status, _, data = http_json(
+            "GET",
+            f"{GOOGLE_FILES_URL}?{params}",
+            headers=_bearer(access_token),
+            timeout=10.0,
+        )
+        if status >= 400:
+            logger.warning(
+                "drive folder lookup answered %s; uploading to My Drive root", status
+            )
+            return None
+        files = data.get("files") if isinstance(data, dict) else None
+        if files:
+            folder_id = files[0].get("id")
+            if folder_id:
+                return str(folder_id)
+
+        # Not found by the app: create it once, then every later upload reuses
+        # the id returned by the lookup above.
+        status, _, created = http_json(
+            "POST",
+            f"{GOOGLE_FILES_URL}?fields=id",
+            headers={**_bearer(access_token), "Content-Type": "application/json"},
+            json_body={"name": folder_name, "mimeType": GOOGLE_FOLDER_MIME},
+            timeout=10.0,
+        )
+        if status >= 400:
+            logger.warning(
+                "drive folder creation answered %s; uploading to My Drive root", status
+            )
+            return None
+        folder_id = created.get("id") if isinstance(created, dict) else None
+        if not folder_id:
+            logger.warning(
+                "drive folder creation returned no id; uploading to My Drive root"
+            )
+            return None
+        return str(folder_id)
+    except Exception as exc:  # noqa: BLE001 - resilience is the contract here
+        logger.warning(
+            "drive folder resolution failed (%s); uploading to My Drive root", exc
+        )
+        return None
+
+
 # -------------------------------------------------------------------- upload
 
 
@@ -412,10 +587,21 @@ def create_upload_target(
     remote_name: str,
     mime_type: str,
     size: int,
+    parent_id: Optional[str] = None,
 ) -> UploadTarget:
-    """Open an upload session for `remote_name` in the user's app folder."""
+    """Open an upload session for `remote_name` in the user's app folder.
+
+    `remote_name` is the real file name, not a path: for Google Drive the
+    app folder is expressed with `parents`, never baked into the name. When
+    `parent_id` is None (folder resolution failed, or the provider does not
+    need one) the file lands in My Drive root — a working upload beats a
+    perfect folder.
+    """
     if provider == "google":
         url = f"{GOOGLE_UPLOAD_SESSION_URL}?uploadType=resumable&fields=id"
+        metadata: Dict[str, Any] = {"name": remote_name, "mimeType": mime_type}
+        if parent_id:
+            metadata["parents"] = [parent_id]
         status, resp_headers, _ = http_bytes(
             "POST",
             url,
@@ -425,7 +611,7 @@ def create_upload_target(
                 "X-Upload-Content-Type": mime_type,
                 "X-Upload-Content-Length": str(size),
             },
-            body=json.dumps({"name": remote_name, "mimeType": mime_type}).encode(),
+            body=json.dumps(metadata).encode(),
         )
         if status >= 400:
             raise upstream("google", f"upload session answered {status}")
@@ -478,13 +664,27 @@ def _download_url(provider: str, file_id: str) -> str:
     return MICROSOFT_GRAPH_DOWNLOAD_URL.format(file_id=file_id)
 
 
+def _header(headers: Dict[str, str], name: str) -> Optional[str]:
+    """Case-insensitive header lookup.
+
+    `http_bytes` returns `dict(response.headers)`, and httpx normalises every
+    key to lowercase, so a direct `headers.get("Content-Type")` silently
+    misses. Match on lowercase and return the first value found.
+    """
+    target = name.lower()
+    for key, value in headers.items():
+        if key.lower() == target:
+            return value
+    return None
+
+
 def _size_from(headers: Dict[str, str]) -> int:
-    content_range = headers.get("Content-Range") or headers.get("content-range") or ""
+    content_range = _header(headers, "Content-Range") or ""
     if "/" in content_range:
         tail = content_range.rsplit("/", 1)[1].strip()
         if tail.isdigit():
             return int(tail)
-    length = headers.get("Content-Length") or headers.get("content-length") or ""
+    length = _header(headers, "Content-Length") or ""
     return int(length) if length.isdigit() else 0
 
 
@@ -502,7 +702,7 @@ def _probe(provider: str, access_token: str, file_id: str) -> Tuple[str, int]:
         raise AppError(404, "cloud_file_unavailable", "The file is not available in the connected drive.")
     if status >= 400:
         raise upstream(provider, f"download answered {status}")
-    mime = headers.get("Content-Type") or headers.get("content-type") or "application/octet-stream"
+    mime = _header(headers, "Content-Type") or "application/octet-stream"
     return mime, _size_from(headers)
 
 
@@ -518,6 +718,11 @@ def open_download(
     provider, which does the ranging, so a ranged media request comes back a
     real 206 with the right Content-Range. A probe first learns size/mime so a
     headless ranged response still carries Content-Length for the player.
+
+    The provider's own `Content-Range`, `Content-Length` and `Accept-Ranges`
+    are forwarded (case-insensitively — httpx lowercases its keys) so the API
+    router can mirror the local-file path exactly: 206 + the provider's
+    Content-Range + the *ranged* length, or 200 + the total length.
     """
     mime, size = _probe(provider, access_token, file_id)
     headers = _bearer(access_token)
@@ -532,9 +737,16 @@ def open_download(
         if status in (401, 403, 404):
             raise AppError(404, "cloud_file_unavailable", "The file is not available in the connected drive.")
         raise upstream(provider, f"download answered {status}")
+    out_headers: Dict[str, str] = {
+        "Content-Type": _header(resp_headers, "Content-Type") or mime,
+    }
+    for name in ("Content-Range", "Content-Length", "Accept-Ranges"):
+        value = _header(resp_headers, name)
+        if value is not None:
+            out_headers[name] = value
     return CloudRead(
         status=status,
-        headers={"Content-Type": resp_headers.get("Content-Type") or mime},
+        headers=out_headers,
         size=size,
         body=body,
     )

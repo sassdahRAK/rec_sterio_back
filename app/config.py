@@ -130,6 +130,10 @@ class Settings(BaseSettings):
     portal_frontend_url: str = "http://localhost:5174"
     # Guest tokens (public browsing, passcode and share redemption).
     guest_ttl_minutes: int = 1440
+    # How long the bot's single-video portal link stays open. The link is pasted
+    # into a Telegram chat and may be opened days later, so it outlives an
+    # ordinary guest session; it still expires rather than granting forever.
+    portal_link_ttl_days: int = 7
 
     # ---- gemini ----
     gemini_api_key: Optional[str] = None

@@ -7,7 +7,8 @@ and exactly one place tests monkeypatch to fake a provider.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, Iterator, Optional, Tuple
+from collections.abc import Iterator as _IteratorABC
+from typing import Any, Dict, Optional, Tuple
 
 import httpx
 
@@ -25,7 +26,9 @@ def http_json(
 ) -> Tuple[int, Dict[str, str], Dict[str, Any]]:
     """One JSON call; returns (status, response_headers, parsed_body)."""
     try:
-        with httpx.request(
+        # `httpx.request` buffers the body and returns a plain Response, which
+        # is NOT a context manager (only Client is); close it explicitly.
+        response = httpx.request(
             method,
             url,
             headers=headers,
@@ -33,13 +36,16 @@ def http_json(
             data=data,
             timeout=timeout,
             follow_redirects=False,
-        ) as response:
+        )
+        try:
             body: Dict[str, Any] = {}
             try:
                 body = response.json() or {}
             except Exception:
                 body = {}
             return response.status_code, dict(response.headers), body
+        finally:
+            response.close()
     except httpx.HTTPError as exc:
         raise AppError(502, "upstream_unreachable", f"Could not reach {url.split('/')[2]}.") from exc
 
@@ -50,6 +56,39 @@ def http_json(
 # connection per provider call and keeps the streaming branch simple.
 _client = httpx.Client(timeout=60.0, follow_redirects=False)
 _stream_client = httpx.Client(timeout=300.0, follow_redirects=False)
+
+
+class _StreamBody(_IteratorABC[bytes]):
+    """Iterator over one streaming response that always releases the stream.
+
+    A bare generator's ``finally`` only runs once the generator has been
+    advanced at least once, so ``gen.close()`` on a never-started generator
+    silently leaves the pooled connection open.  This wrapper exits the httpx
+    stream context exactly once, whether the body is consumed fully, closed
+    early, or closed without ever being iterated.
+    """
+
+    def __init__(self, raw: Any, response: Any) -> None:
+        self._raw = raw
+        self._chunks = response.iter_bytes(512 * 1024)
+        self._closed = False
+
+    def __next__(self) -> bytes:
+        if self._closed:
+            raise StopIteration
+        try:
+            return next(self._chunks)
+        except BaseException:
+            self._release()
+            raise
+
+    def close(self) -> None:
+        self._release()
+
+    def _release(self) -> None:
+        if not self._closed:
+            self._closed = True
+            self._raw.__exit__(None, None, None)
 
 
 def http_bytes(
@@ -75,14 +114,9 @@ def http_bytes(
         raise AppError(502, "upstream_unreachable", f"Could not reach {url.split('/')[2]}.") from exc
 
     if not stream:
-        with response:
-            return response.status_code, dict(response.headers), response.content
-
-    def _iter() -> Iterator[bytes]:
         try:
-            for chunk in response.iter_bytes(512 * 1024):
-                yield chunk
+            return response.status_code, dict(response.headers), response.content
         finally:
-            raw.__exit__(None, None, None)
+            response.close()
 
-    return response.status_code, dict(response.headers), _iter()
+    return response.status_code, dict(response.headers), _StreamBody(raw, response)

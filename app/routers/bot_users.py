@@ -206,7 +206,7 @@ def give_consent(
         raise AppError(
             422,
             "version_mismatch",
-            "The consent text has changed — run /cookies again.",
+            "The consent text has changed. Run /cookies again.",
             [{"field": "consent_version", "expected": CONSENT_VERSION}],
         )
     now = datetime.now(timezone.utc)
@@ -417,11 +417,14 @@ def require_session_consent(db: Session, principal: Principal, source_url: str) 
 
     Called from `create_video` after the dedupe check: an already-known URL
     is returned to anyone, but a *new* gated download must run under the
-    requesting user's cookies. The bot's service identity ("telegram:bot",
-    no user id) and every non-telegram principal pass untouched.
+    requesting user's cookies. The gate is keyed on the ACTOR, never the role:
+    a Telegram user linked to an active console account resolves to that
+    account's role (`admin`, `user`, ...), so `principal.role == "telegram"`
+    would silently exempt exactly the linked users from their own consent. A
+    `telegram:<digits>` actor is a person acting through the bot and must
+    consent; `telegram:bot` (the service identity) and every non-Telegram actor
+    pass untouched.
     """
-    if principal.role != "telegram":
-        return
     prefix = "telegram:"
     if not principal.actor.startswith(prefix):
         return

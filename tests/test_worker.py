@@ -7,6 +7,8 @@ import wave
 from datetime import timedelta
 from pathlib import Path
 
+import pytest
+
 from app.config import settings
 from app.db import SessionLocal
 from app.models import Job, Transcript, Video
@@ -18,6 +20,7 @@ from app.services.downloader import DownloadResult
 from app.worker import main as worker_main
 from app.worker import queue, runner
 from app.worker.runner import (
+    PermanentJobError,
     handle_extract_audio,
     handle_gemini_transcribe,
     handle_transcribe,
@@ -84,6 +87,92 @@ def test_transcribe_job_creates_a_transcript(monkeypatch):
         assert transcripts[0].segments[1]["language"] == "km"
         video = db.get(Video, video_id)
         assert video.status == "transcribed"
+
+
+def test_transcribe_works_for_a_cloud_video_with_only_the_extracted_audio(monkeypatch):
+    """D1: a cloud-backed video has no local media after audio extraction.
+
+    The live flow is: `complete` downloads a `.cloud-tmp`, `extract_audio`
+    writes `audio.wav` and then `_cleanup_cloud_temp` deletes the temp copy.
+    The chained `transcribe` job calls `_ensure_audio` again, so its existing
+    audio check must run before any media lookup — otherwise the job fails
+    permanently with "No downloaded media found" although the wav is present.
+
+    Fails on the old code: `_ensure_audio` called `find_media_file` first and
+    raised `PermanentJobError` before reaching the audio fast path.
+    """
+    with SessionLocal() as db:
+        video = Video(
+            source_url="upload://clip.mp4",
+            platform="direct",
+            status="transcribing",
+            storage_backend="google",
+            drive_file_id="file-cloud",
+        )
+        db.add(video)
+        db.commit()
+        db.refresh(video)
+        video_id = str(video.id)
+
+    storage.video_dir(video_id)
+    audio = storage.audio_file(video_id)
+    with wave.open(str(audio), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(16000)
+        wf.writeframes(b"\x00\x00" * 16000)
+    # The cloud temp copy is gone, exactly as `_cleanup_cloud_temp` leaves it.
+    assert storage.find_media_file(video_id) is None
+
+    seen = {}
+
+    def fake_transcribe(audio_path, engine=None, engine_name=None):
+        seen["audio"] = Path(audio_path)
+        return FakeEngine().transcribe(Path(audio_path))
+
+    monkeypatch.setattr(asr_service, "transcribe_audio", fake_transcribe)
+    with SessionLocal() as db:
+        job = queue.enqueue(db, "transcribe", video_id=video_id)
+        db.commit()
+        job_id = str(job.id)
+
+    with SessionLocal() as db:
+        job = db.get(Job, job_id)
+        run_job(db, job)
+        assert job.status == "succeeded", job.last_error
+        transcript = (
+            db.query(Transcript).filter(Transcript.video_id == video_id).one()
+        )
+        assert "hello world" in transcript.content
+        assert db.get(Video, video_id).status == "transcribed"
+
+    # ASR read the extracted wav, the only sensible input for a cloud video.
+    assert seen["audio"] == audio
+
+
+def test_cloud_video_without_audio_or_media_reports_the_missing_input():
+    """Only a genuinely empty cloud video fails, with an accurate message.
+
+    A cloud-backed video legitimately has no local media; the error must say
+    the extracted audio is missing too instead of blaming a download that is
+    not going to re-run.
+    """
+    with SessionLocal() as db:
+        video = Video(
+            source_url="upload://gone.mp4",
+            platform="direct",
+            status="transcribing",
+            storage_backend="google",
+        )
+        db.add(video)
+        db.commit()
+        db.refresh(video)
+
+        with pytest.raises(PermanentJobError) as raised:
+            runner._ensure_audio(db, video)
+
+    assert "extracted audio" in str(raised.value)
+    assert "cloud-stored" in str(raised.value)
 
 
 def test_transcription_is_idempotent(monkeypatch):
@@ -339,13 +428,16 @@ def test_worker_alive_stays_true_while_a_handler_runs(monkeypatch, tmp_path):
         worker_main._last_heartbeat = 0.0
 
 
-def test_compress_job_is_not_reclaimed_inside_its_longer_window():
+def test_compress_job_is_not_reclaimed_inside_its_longer_window(monkeypatch):
     """A long transcode is progress, not an abandoned run.
 
     A `compress_video` row older than the generic 1800 s window but younger
     than its own (4 h) window must survive `claim_job`; a generic kind in the
     same state must be reclaimed. Proves the kind-aware mapping applies.
     """
+    # The window comes from WORKER_COMPRESS_STALE_SECONDS; pin it so a
+    # developer's .env cannot invalidate the premise of this test.
+    monkeypatch.setattr(settings, "worker_compress_stale_seconds", 14400)
     compress_window = max(
         queue.STALE_RUNNING_SECONDS, int(settings.worker_compress_stale_seconds)
     )

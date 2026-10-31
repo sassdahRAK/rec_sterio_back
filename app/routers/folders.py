@@ -82,6 +82,13 @@ def _current_user(db: Session, principal: Principal) -> AdminUser:
             raise AppError(401, "unauthorized", "Invalid or expired token.")
         return user
 
+    # Deliberate and bot-gated: this branch stays role-based on purpose. Every
+    # folder creation through the bot is `/mkdir`, which the bot itself gates
+    # on ADMIN_TELEGRAM_IDS, and it attributes the folder to the bootstrap
+    # operator because the service identity names no owning account. A plain
+    # `telegram:<uid>` reaching this route directly has already passed the
+    # `principal.is_signed_in` branch above or is a bot person the bot admits;
+    # do not "fix" this into an actor check without moving that admin gate.
     if principal.role == "telegram":
         email = (settings.admin_email or "").strip().lower()
         admin = (
@@ -208,10 +215,15 @@ def create_folder(
     principal: Principal = Depends(get_principal),
 ) -> FolderOut:
     user = _current_user(db, principal)
-    # Only the operator publishes to anonymous visitors. The bot counts: its
-    # commands are gated by ADMIN_TELEGRAM_IDS, and it can already issue share
-    # links and passcodes for the folder.
-    if payload.visibility == "public" and principal.role not in ADMIN_TIER + ("telegram",):
+    # Only the operator publishes to anonymous visitors. The bot's service
+    # identity counts: its commands are gated by ADMIN_TELEGRAM_IDS, and it can
+    # already issue share links and passcodes for the folder. A person acting
+    # through the bot does NOT — they hold only what their account allows.
+    if (
+        payload.visibility == "public"
+        and principal.role not in ADMIN_TIER
+        and not principal.is_bot_service
+    ):
         raise AppError(
             403, "forbidden", "Only an admin can create a public folder.",
             [{"field": "visibility"}],
@@ -379,6 +391,21 @@ def place_video(
 # ----------------------------------------------------------- dataset cards
 
 
+def _scoped_video_uuids(principal: Principal) -> list[UUID]:
+    """The portal-link ids as UUIDs for SQL, skipping any malformed claim.
+
+    The claim is signed by this app, so a bad value should not exist; a
+    malformed one is dropped rather than turning the whole listing into a 500.
+    """
+    out: list[UUID] = []
+    for raw in principal.scoped_video_ids:
+        try:
+            out.append(UUID(str(raw)))
+        except (ValueError, TypeError, AttributeError):
+            continue
+    return out
+
+
 def _card(
     db: Session, video: Video, folder: Optional[Folder], principal: Principal
 ) -> DataCardOut:
@@ -392,6 +419,8 @@ def _card(
         title=video.title,
         source_url=video.source_url,
         status=video.status,
+        progress=video.progress or 0,
+        error=video.error,
         duration_seconds=video.duration_seconds,
         thumbnail_url=video.thumbnail_url,
         folder_id=video.folder_id,
@@ -440,13 +469,24 @@ def list_dataset_cards(
         folder = folder_or_404(db, folder_id)
         require_read(db, folder, principal)
 
-    if principal.role in LIBRARY_VIEW_ROLES + ("telegram",):
+    if principal.role in LIBRARY_VIEW_ROLES or principal.is_bot_service:
         stmt = select(Video)
     else:
         accessible = list(roles.keys())
         conditions = [Video.created_by == principal.actor]
         if accessible:
             conditions.append(Video.folder_id.in_(accessible))
+        # A portal-link token names exactly one unit — usually an unfiled row
+        # no folder rule can reach. It is admitted only when the request names
+        # it: the grant is "open this one video", not "list what you hold", so
+        # a bare listing (and search, which shares this query) stays empty
+        # instead of returning the scoped row. Without the condition an
+        # explicitly requested id would never reach the python `video_role`
+        # filter below, which already agrees (`video_role` returns the scoped
+        # role for that id).
+        scoped_videos = _scoped_video_uuids(principal)
+        if scoped_videos and video_id is not None:
+            conditions.append(Video.id.in_(scoped_videos))
         stmt = select(Video).where(or_(*conditions))
 
     if folder_id is not None:
@@ -467,7 +507,7 @@ def list_dataset_cards(
     # here keeps `total` and the page coherent. The admin tier and the bot
     # pass it unconditionally; a plain user's or guest's scope already agrees
     # with it.
-    if principal.role not in ADMIN_TIER + ("telegram",):
+    if principal.role not in ADMIN_TIER and not principal.is_bot_service:
         videos = [v for v in videos if video_role(db, v, principal) is not None]
 
     if cleaned is not None:

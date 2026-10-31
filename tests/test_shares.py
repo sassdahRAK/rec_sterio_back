@@ -31,7 +31,17 @@ def _make_share(client, headers, folder_id, **payload):
 # ------------------------------------------------------------------ creating
 
 
-def test_create_share_returns_a_token_and_a_portal_url(client, auth_headers):
+def test_create_share_returns_a_token_and_a_portal_url(
+    client, auth_headers, monkeypatch
+):
+    from app.config import settings
+
+    # The URL is derived from PORTAL_FRONTEND_URL, which each operator points at
+    # their own portal host (a LAN IP, a public domain, ...). Pin it here so the
+    # test never reads the developer's .env.
+    portal = "https://portal.test.example"
+    monkeypatch.setattr(settings, "portal_frontend_url", portal)
+
     folder = make_folder(client, auth_headers, name="Dataset")
     body = _make_share(client, auth_headers, folder["id"])
 
@@ -40,7 +50,7 @@ def test_create_share_returns_a_token_and_a_portal_url(client, auth_headers):
     assert body["folder_id"] == folder["id"]
     assert body["revoked_at"] is None
     # The link points at the guest portal, not the operator console.
-    assert body["url"].startswith("http://localhost:5174/share/")
+    assert body["url"] == f"{portal}/share/{body['token']}"
     assert body["token"] in body["url"]
 
 
