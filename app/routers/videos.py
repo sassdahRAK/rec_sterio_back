@@ -29,6 +29,7 @@ from app.auth import (
     get_optional_principal,
     get_principal,
     issue_portal_link_token,
+    linked_active_admin,
 )
 from app.config import settings
 from app.db import get_db
@@ -110,16 +111,18 @@ def _telegram_person_scope(db: Session, principal: Principal):
     An unlinked Telegram user is limited to public folders and their own rows —
     a link that lives in someone's private folder is invisible to them, and a
     re-paste creates their own copy rather than disclosing the original.
-    """
-    from app.models import AdminUser
 
+    The link is resolved by `auth.linked_active_admin`, the same resolver the
+    request principal goes through, and an INACTIVE account counts as no link.
+    The two must agree: if this scope honored a link that auth had already
+    rejected, a deactivated account's uid would resolve as a plain `telegram`
+    person and then re-enter here as that account, widening the dedupe scope
+    back to a library it may no longer read (a URL-existence oracle that also
+    blocks re-ingest). Auth first, scope second — same answer both times.
+    """
     conditions = [Video.created_by == principal.actor]
     uid = principal.email
-    linked = None
-    if uid and uid.isdigit():
-        linked = db.execute(
-            select(AdminUser).where(AdminUser.telegram_user_id == int(uid))
-        ).scalar_one_or_none()
+    linked = linked_active_admin(db, uid) if uid and uid.isdigit() else None
     if linked is not None:
         as_console = Principal(f"{linked.role}:{linked.email}", linked.role, linked.email)
         visible = list(visible_folders(db, as_console).keys())

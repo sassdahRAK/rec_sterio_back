@@ -260,6 +260,31 @@ def actor_role(actor: str) -> str:
     return actor.split(":", 1)[0] if ":" in actor else actor
 
 
+def linked_active_admin(db: Session, uid) -> Optional[AdminUser]:
+    """The ACTIVE console account a Telegram user id is linked to, or None.
+
+    This is the single resolver for the `X-Requested-By: telegram:<uid>` link,
+    because two places must agree on it: `_resolve_principal` below (which
+    grants the linked account's role) and the ingest de-duplication scope in
+    `routers/videos._telegram_person_scope` (which decides what a re-pasted URL
+    may collide with). If the de-dupe scope kept accepting a link that auth
+    rejects — e.g. a row deactivated since it was linked — a deactivated
+    account's uid would still widen the dedupe scope to that account's whole
+    library, giving back the URL-existence oracle and blocked re-ingest that
+    scoping exists to close. Inactive means unlinked here, exactly as it means
+    "no role" in `_resolve_principal`.
+    """
+    text = str(uid)
+    if not text.isdigit():
+        return None
+    return db.execute(
+        select(AdminUser).where(
+            AdminUser.telegram_user_id == int(text),
+            AdminUser.is_active.is_(True),
+        )
+    ).scalar_one_or_none()
+
+
 def _resolve_principal(
     request: Request, token: str, db: Session, required: bool = True
 ) -> Principal:
@@ -294,12 +319,7 @@ def _resolve_principal(
             # unit the user ingested. Only the role (and the display email)
             # change; the actor is the stable ownership key.
             if uid.isdigit():
-                linked = db.execute(
-                    select(AdminUser).where(
-                        AdminUser.telegram_user_id == int(uid),
-                        AdminUser.is_active.is_(True),
-                    )
-                ).scalar_one_or_none()
+                linked = linked_active_admin(db, uid)
                 if linked is not None:
                     return Principal(
                         actor=f"telegram:{uid}", role=linked.role, email=linked.email

@@ -14,10 +14,10 @@ from sqlalchemy import select
 
 from app.config import settings
 from app.db import SessionLocal
-from app.models import BotUser, Job
+from app.models import AdminUser, BotUser, Job
 from app.routers.bot_users import CONSENT_VERSION
 from app.services import storage
-from tests.helpers import telegram_user_headers
+from tests.helpers import ensure_user, telegram_user_headers, user_headers
 
 UID = 12345
 TIKTOK_URL = "https://www.tiktok.com/@someplace/video/7000000000000000001"
@@ -346,3 +346,86 @@ def test_a_private_unit_is_not_disclosed_by_dedupe(client, auth_headers):
     )
     assert resp.status_code == 403, resp.text
     assert resp.json()["error"]["code"] == "consent_required"
+
+
+# -------------------------------- linked vs unlinked dedupe scope (regression)
+
+
+def _account_private_unit(client, tag: str):
+    """A user account's own private folder holding one un-gated YOUTUBE_URL."""
+    email = ensure_user(tag)
+    headers = user_headers(email)
+    folder = client.post(
+        "/api/v1/folders",
+        json={"name": f"{tag} private", "visibility": "private"},
+        headers=headers,
+    )
+    assert folder.status_code == 201, folder.text
+    created = client.post(
+        "/api/v1/videos",
+        json={"source_url": YOUTUBE_URL, "folder_id": folder.json()["id"]},
+        headers=headers,
+    )
+    assert created.status_code == 201, created.text
+    return email, created.json()
+
+
+def _bind_telegram(email: str, uid: int, *, active: bool = True) -> None:
+    """Attach a Telegram id to the account, optionally leaving it deactivated."""
+    with SessionLocal() as db:
+        row = db.execute(
+            select(AdminUser).where(AdminUser.email == email)
+        ).scalar_one()
+        row.telegram_user_id = uid
+        row.is_active = active
+        db.commit()
+
+
+def test_an_active_link_keeps_the_person_scope(client):
+    """An ACTIVE linked account still dedupes against what that account can read.
+
+    The uid resolves to the account in auth, so a re-paste of a unit in the
+    account's own private folder is the usual 409 with the existing id.
+    """
+    email, created = _account_private_unit(client, "active-dedupe-owner")
+    _bind_telegram(email, 42001)
+
+    resp = client.post(
+        "/api/v1/videos",
+        json={"source_url": YOUTUBE_URL},
+        headers=telegram_user_headers(42001),
+    )
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["error"]["code"] == "conflict"
+    assert resp.json()["video"]["id"] == created["id"]
+
+
+def test_a_deactivated_link_behaves_like_an_unlinked_user(client):
+    """A link to a DEACTIVATED account is no link at all.
+
+    Auth resolves the uid as a plain `telegram` person; the dedupe scope must
+    reach the same conclusion. Otherwise the uid re-enters the scope as the
+    deactivated account, and a URL that lives in that account's private folder
+    becomes an oracle (409 disclosing the unit) and blocks the ingest. As an
+    unlinked user the folder is invisible, so the ingest proceeds and the
+    original id is never disclosed.
+    """
+    email, created = _account_private_unit(client, "inactive-dedupe-owner")
+    _bind_telegram(email, 42002, active=False)
+
+    resp = client.post(
+        "/api/v1/videos",
+        json={"source_url": YOUTUBE_URL},
+        headers=telegram_user_headers(42002),
+    )
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["id"] != created["id"]
+    assert created["id"] not in resp.text
+    # The new row is the uid's own ingest, not a disclosure of the private one.
+    with SessionLocal() as db:
+        rows = (
+            db.execute(select(Job).where(Job.video_id == resp.json()["id"]))
+            .scalars()
+            .all()
+        )
+        assert len(rows) == 1
