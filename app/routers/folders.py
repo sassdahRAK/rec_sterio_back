@@ -58,7 +58,7 @@ from app.schemas import (
     VideoFolderUpdate,
     VideoOut,
 )
-from app.services import storage, zip_export
+from app.services import storage, thumbnail, zip_export
 from app.services.storage import cloud_storage_available
 
 logger = logging.getLogger("recsterio.folders")
@@ -422,7 +422,9 @@ def _card(
         progress=video.progress or 0,
         error=video.error,
         duration_seconds=video.duration_seconds,
-        thumbnail_url=video.thumbnail_url,
+        # Local frame when one is cached and the folder is published; the
+        # stored CDN URL otherwise (unchanged for private rows).
+        thumbnail_url=thumbnail.public_thumbnail_url(video, folder),
         folder_id=video.folder_id,
         folder_name=folder.name if folder else None,
         copied_from_id=video.copied_from_id,

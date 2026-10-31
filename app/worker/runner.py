@@ -20,7 +20,7 @@ from app.db import SessionLocal
 from app.models import Job, Merge, Transcript, Video
 from app.schemas import sanitize_technical_error
 from app.services import asr as asr_service
-from app.services import downloader, gemini as gemini_service, storage
+from app.services import downloader, gemini as gemini_service, storage, thumbnail
 from app.services.merger import (
     MergeResult,
     merge_result_to_diff,
@@ -325,6 +325,17 @@ def handle_download(db: Session, job: Job) -> None:
         date_posted=video.date_posted or result.date_posted,
         error=None,
     )
+
+    # Keep the frame on disk while the platform's signed URL still works: the
+    # URL expires within hours and the card would then render a blank. This is
+    # decoration only, so no exception may fail the ingest.
+    thumb_source = video.thumbnail_url or result.thumbnail_url
+    if thumb_source:
+        try:
+            thumbnail.cache_from_url(video.id, thumb_source)
+        except Exception as exc:  # noqa: BLE001 - never fail the job for a thumbnail
+            logger.warning("thumbnail caching failed for %s: %s", video.id, exc)
+
     _continue_chain(db, job)
 
 

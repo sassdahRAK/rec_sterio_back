@@ -28,6 +28,7 @@ from app.access import (
     masks_public_folders,
     require_read,
     role_on_folder,
+    video_role,
 )
 from app.auth import Principal, get_optional_principal, issue_folder_token
 from app.config import settings
@@ -43,7 +44,7 @@ from app.schemas import (
     ShareRedeem,
 )
 from app.security import client_ip, enforce_rate_limit
-from app.services import storage, zip_export
+from app.services import storage, thumbnail, zip_export
 from app.services.storage import cloud_storage_available
 from app.services.zip_export import safe_name
 
@@ -72,7 +73,9 @@ def _video_cards(db: Session, folder: Folder) -> list[DataCardOut]:
                 source_url=video.source_url,
                 status=video.status,
                 duration_seconds=video.duration_seconds,
-                thumbnail_url=video.thumbnail_url,
+                # A cached frame is served from this API: the platform's
+                # signed CDN URL expires and the card then shows a blank.
+                thumbnail_url=thumbnail.public_thumbnail_url(video, folder),
                 folder_id=folder.id,
                 folder_name=folder.name,
                 # instruction.txt #8: the badge tells a visitor whether a human
@@ -223,6 +226,41 @@ def download_folder_zip(
         media_type="application/zip",
         filename=filename,
         background=background,
+    )
+
+
+@router.get("/videos/{video_id}/thumbnail")
+def get_public_video_thumbnail(
+    video_id: UUID,
+    db: Session = Depends(get_db),
+    principal: Principal = Depends(get_optional_principal),
+) -> FileResponse:
+    """The frame the API cached for one video.
+
+    Access is the same predicate the card builders apply: a folder the caller
+    can read (public, or scoped by the passcode/share token they present) or,
+    for a portal-link token, the one unit it names. An unreadable video is a
+    plain 404, never a 403, so the answer cannot confirm that a private unit
+    exists. A readable video with no cached frame is a 404 too.
+    """
+    video = db.get(Video, video_id)
+    if video is None or video_role(db, video, principal) is None:
+        # The wording and shape match every other "Video not found" in the API.
+        raise AppError(404, "not_found", "Video not found.", [{"id": str(video_id)}])
+    path = storage.thumbnail_file(video.id)
+    if path is None:
+        raise AppError(
+            404,
+            "thumbnail_not_ready",
+            "This video has no thumbnail yet.",
+            [{"id": str(video_id)}],
+        )
+    return FileResponse(
+        path,
+        media_type=storage.guess_mime(path),
+        # The bytes for a given id never change, and they no longer sit behind
+        # an expiring signature, so a long immutable cache is safe.
+        headers={"Cache-Control": "public, max-age=604800, immutable"},
     )
 
 

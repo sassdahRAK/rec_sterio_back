@@ -16,6 +16,12 @@ AUDIO_MP3_FILENAME = "audio.mp3"
 MEDIA_STEM = "media"
 # Delivery-only copy for sending to a chat; never an ASR input.
 COMPRESSED_STEM = "compressed"
+# A locally cached frame. Platform CDN URLs are signed and expire, so the card
+# is served from this file instead (see app.services.thumbnail).
+THUMBNAIL_STEM = "thumbnail"
+THUMBNAIL_EXTS = ("jpg", "jpeg", "png", "webp")
+# A frame is decoration: anything larger than this is not a thumbnail.
+THUMBNAIL_MAX_BYTES = 5 * 1024 * 1024
 
 
 def media_root() -> Path:
@@ -80,6 +86,80 @@ def find_compressed_file(video_id: UUID | str) -> Optional[Path]:
     return None
 
 
+def thumbnail_file(video_id: UUID | str) -> Optional[Path]:
+    """The cached frame for this video, if one was saved, else None.
+
+    The extension is chosen when the bytes are stored (see `save_thumbnail`),
+    so this looks for each supported extension in a stable order.
+    """
+    d = media_root() / str(video_id)
+    if not d.is_dir():
+        return None
+    for ext in THUMBNAIL_EXTS:
+        path = d / f"{THUMBNAIL_STEM}.{ext}"
+        if path.is_file():
+            return path
+    return None
+
+
+def sniff_image_ext(data: bytes) -> Optional[str]:
+    """The real image type from its magic bytes.
+
+    CDNs routinely send an `application/octet-stream` (or wrong) Content-Type
+    for a perfectly valid JPEG, so the bytes themselves decide the extension.
+    """
+    if data.startswith(b"\xff\xd8\xff"):
+        return "jpg"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp"
+    return None
+
+
+def _declared_image_ext(content_type: str) -> Optional[str]:
+    mime = (content_type or "").split(";", 1)[0].strip().lower()
+    return {
+        "image/jpeg": "jpg",
+        "image/jpg": "jpg",
+        "image/pjpeg": "jpg",
+        "image/png": "png",
+        "image/webp": "webp",
+    }.get(mime)
+
+
+def save_thumbnail(video_id: UUID | str, data: bytes, content_type: str) -> Path:
+    """Write the frame into the video's media dir, atomically.
+
+    The extension comes from the bytes (sniffed) before the declared type, so a
+    lying Content-Type cannot mislabel the file. More than
+    `THUMBNAIL_MAX_BYTES` is refused: a giant payload is not a card thumbnail.
+    Returns the stored path.
+    """
+    if not data:
+        raise ValueError("thumbnail payload is empty")
+    if len(data) > THUMBNAIL_MAX_BYTES:
+        raise ValueError("thumbnail payload exceeds the 5 MB limit")
+    ext = sniff_image_ext(data) or _declared_image_ext(content_type)
+    if ext is None:
+        raise ValueError("thumbnail payload is not a supported image")
+    d = video_dir(video_id)
+    target = d / f"{THUMBNAIL_STEM}.{ext}"
+    tmp = d / f"{THUMBNAIL_STEM}.{ext}.tmp"
+    try:
+        tmp.write_bytes(data)
+        os.replace(tmp, target)
+    finally:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
+    # A re-cache in a different format must not leave the old frame behind:
+    # `thumbnail_file` would keep returning it.
+    for other in list(d.iterdir()):
+        if other.is_file() and other.stem == THUMBNAIL_STEM and other != target:
+            other.unlink(missing_ok=True)
+    return target
+
+
 def cloud_media_file(video_id: UUID | str) -> Path:
     """Temp local copy of a cloud-stored video, for the extract/transcribe pipeline.
 
@@ -123,6 +203,8 @@ def guess_mime(path: Path) -> str:
 
 
 def delete_video_files(video_id: UUID | str) -> None:
+    # Removes the whole directory, so the cached thumbnail (THUMBNAIL_STEM)
+    # and every other derived artefact go with it; nothing extra to clean up.
     d = media_root() / str(video_id)
     if d.exists():
         shutil.rmtree(d, ignore_errors=True)
