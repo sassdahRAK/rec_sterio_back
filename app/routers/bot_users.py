@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import logging
 import os
+import tempfile
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, File, Request, Response, UploadFile
@@ -341,10 +343,18 @@ async def upload_cookies(
         )
 
     dest = storage.cookie_file(telegram_id)
-    tmp = dest.with_name(dest.name + ".tmp")
+    # One unique temp per request, in the SAME directory so the final
+    # `os.replace` stays on one filesystem (atomic). A fixed name would make two
+    # concurrent uploads for the same user share one inode: interleaved writes,
+    # a partial file renamed into place, and one request's cleanup unlinking the
+    # other's temp.
+    fd, tmp_name = tempfile.mkstemp(
+        dir=dest.parent, prefix=dest.name + ".", suffix=".tmp"
+    )
+    tmp: Optional[Path] = Path(tmp_name)
     written = 0
     try:
-        with tmp.open("wb") as out:
+        with os.fdopen(fd, "wb") as out:
             while True:
                 chunk = await file.read(64 * 1024)
                 if not chunk:
@@ -358,28 +368,59 @@ async def upload_cookies(
                         [{"limit_bytes": limit_bytes}],
                     )
                 out.write(chunk)
+
+        # The file holds a live session: only its owner (and the service) may
+        # read it. Set 0600 on the TEMP, before the rename, so the name is never
+        # visible with the process umask for even an instant. mkstemp already
+        # creates 0600; this makes it explicit and fails closed if it did not.
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError as exc:
+            raise AppError(
+                500, "upload_failed", "Could not secure the cookies file."
+            ) from exc
+
+        if not _looks_like_netscape_cookies(tmp):
+            raise AppError(
+                422,
+                "invalid_cookies_file",
+                "That does not look like a Netscape cookies.txt export. Export one "
+                "with a 'Get cookies.txt LOCALLY' style browser extension (or "
+                "yt-dlp --cookies-from-browser) and send that file.",
+                [{"field": "file"}],
+            )
+
+        os.replace(tmp, dest)
+        tmp = None  # ownership passed to dest; nothing left to clean up
     except AppError:
-        tmp.unlink(missing_ok=True)
         raise
     except OSError as exc:
-        tmp.unlink(missing_ok=True)
         raise AppError(500, "upload_failed", "Could not store the cookies file.") from exc
+    finally:
+        # Every failure path above leaves `tmp` set, so this removes exactly
+        # this request's temp and never another request's.
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
 
-    if not _looks_like_netscape_cookies(tmp):
-        tmp.unlink(missing_ok=True)
-        raise AppError(
-            422,
-            "invalid_cookies_file",
-            "That does not look like a Netscape cookies.txt export. Export one "
-            "with a 'Get cookies.txt LOCALLY' style browser extension (or "
-            "yt-dlp --cookies-from-browser) and send that file.",
-            [{"field": "file"}],
+    # Belt and braces: the renamed file is already 0600, so this can only keep
+    # it that way. Best effort; a failure here must not undo the upload.
+    try:
+        os.chmod(dest, 0o600)
+    except OSError:
+        logger.exception("could not re-assert 0600 on %s", dest)
+    # Digest exactly the bytes that landed, after the atomic replace. A failed
+    # read must not cost the user an upload that already succeeded on disk: log
+    # it, record the digest as unknown (NULL), and still answer success.
+    try:
+        digest = storage.sha256_file(dest)
+    except OSError:
+        digest = None
+        logger.exception(
+            "cookies stored for telegram user %s at %s but the checksum "
+            "could not be computed",
+            telegram_id,
+            dest,
         )
-
-    os.replace(tmp, dest)
-    # The file holds a live session: only its owner (and the service) may read it.
-    os.chmod(dest, 0o600)
-    digest = storage.sha256_file(dest)
 
     now = datetime.now(timezone.utc)
     row = _get_row(db, telegram_id)
@@ -434,11 +475,22 @@ def require_session_consent(db: Session, principal: Principal, source_url: str) 
     if detect_platform(source_url) not in SESSION_GATED_PLATFORMS:
         return
     row = _get_row(db, int(uid))
-    if row is not None and row.consented and storage.cookie_file(int(uid)).exists():
+    consented = bool(row.consented) if row is not None else False
+    cookies_present = storage.cookie_file(int(uid)).exists()
+    if consented and cookies_present:
         return
     raise AppError(
         403,
         "consent_required",
         "Run /cookies in the bot to allow downloads with your own session.",
-        [{"field": "source_url", "issue": "consent_required"}],
+        [
+            {
+                "field": "source_url",
+                "issue": "consent_required",
+                # Which half of the gate is missing, so the bot can word the
+                # hint precisely: agree to the consent, send the file, or both.
+                "consented": consented,
+                "cookies_present": cookies_present,
+            }
+        ],
     )
