@@ -271,10 +271,12 @@ def handle_download(db: Session, job: Job) -> None:
     _set_video(db, video, status="downloading", progress=0, error=None)
     db.commit()
 
-    # A video ingested by a Telegram user ("telegram:<id>") downloads under
-    # that user's own cookies when they uploaded some; every other actor
-    # ("system", "admin:<email>", the bot's "telegram:bot") uses server
-    # defaults.
+    # Cookies are an optional override, never a gate. A video ingested by a
+    # Telegram user ("telegram:<id>") downloads under that user's own file when
+    # they uploaded one; otherwise the operator's shared jar is the fallback.
+    # With neither, `downloader` keeps its YTDLP_COOKIES_FILE default (usually
+    # none), which many platforms accept. Every other actor ("system",
+    # "admin:<email>", the bot's "telegram:bot") uses the server defaults.
     cookiefile = None
     if video.created_by and video.created_by.startswith("telegram:"):
         uid = video.created_by.split(":", 1)[1]
@@ -282,6 +284,10 @@ def handle_download(db: Session, job: Job) -> None:
             user_cookies = storage.cookie_file(int(uid))
             if user_cookies.exists():
                 cookiefile = str(user_cookies)
+    if cookiefile is None:
+        shared_cookies = storage.shared_cookies_file()
+        if shared_cookies.exists():
+            cookiefile = str(shared_cookies)
 
     def _progress(percent: int) -> None:
         with SessionLocal() as pdb:

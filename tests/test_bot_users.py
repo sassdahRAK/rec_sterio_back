@@ -1,15 +1,17 @@
-"""Bot users: consent records, per-user cookies storage and the ingest gate.
+"""Bot users: consent records, per-user cookies storage and optional fallback.
 
 The /bot-users routes require BOTH the bot service token and the user's own
-Telegram id, so one user can never act on another's cookies. The consent
-gate in POST /videos enforces that a gated (TikTok/Facebook) download runs
-under the requesting user's own session.
+Telegram id, so one user can never act on another's cookies. Cookies are an
+optional override: POST /videos never refuses a TikTok or Facebook link for
+want of a consent row or a file, and the worker falls back to the operator's
+shared jar only when the requesting user has none.
 """
 from __future__ import annotations
 
 import hashlib
 import os
 
+import pytest
 from sqlalchemy import select
 
 from app.config import settings
@@ -52,14 +54,6 @@ def _upload(client, content: bytes, uid: int = UID):
     return client.post(
         f"/api/v1/bot-users/{uid}/cookies",
         files={"file": ("cookies.txt", content, "text/plain")},
-        headers=telegram_user_headers(uid),
-    )
-
-
-def _gated_ingest(client, uid: int):
-    return client.post(
-        "/api/v1/videos",
-        json={"source_url": TIKTOK_URL},
         headers=telegram_user_headers(uid),
     )
 
@@ -242,23 +236,44 @@ def test_withdraw_is_idempotent(client):
     assert again.status_code == 204
 
 
-# ------------------------------------------------- the consent gate on /videos
+# ------------------------------------- cookies are an optional override, not a gate
 
 
-def test_gate_blocks_a_tiktok_download_without_consent(client):
+@pytest.fixture(autouse=True)
+def shared_cookies_path(tmp_path, monkeypatch):
+    """Keep every test off the real backend/storage/shared_cookies.txt."""
+    path = tmp_path / "shared_cookies.txt"
+    monkeypatch.setattr(storage, "shared_cookies_file", lambda: path)
+    return path
+
+
+def test_a_tiktok_link_without_consent_or_a_file_is_still_accepted(client):
+    """The old gate demanded cookies; the platform does not. No 403."""
     resp = client.post(
         "/api/v1/videos",
         json={"source_url": TIKTOK_URL},
         headers=telegram_user_headers(999),
     )
-    assert resp.status_code == 403, resp.text
-    assert resp.json()["error"]["code"] == "consent_required"
-    # The gate fires before the insert, so no video and no job may exist.
+    assert resp.status_code == 201, resp.text
+    video_id = resp.json()["id"]
     with SessionLocal() as db:
-        assert db.execute(select(Job)).scalars().all() == []
+        job = db.execute(
+            select(Job).where(Job.video_id == video_id, Job.kind == "download")
+        ).scalar_one_or_none()
+        assert job is not None and job.status == "queued"
 
 
-def test_gate_passes_after_consent_and_cookies(client):
+def test_the_error_code_is_never_consent_required_without_cookies(client):
+    resp = client.post(
+        "/api/v1/videos",
+        json={"source_url": "https://www.tiktok.com/@someplace/video/7000000000000000002"},
+        headers=telegram_user_headers(1002),
+    )
+    assert resp.status_code == 201, resp.text
+    assert "consent_required" not in resp.text
+
+
+def test_consented_user_with_cookies_creates_a_video(client):
     uid = 999
     _consent(client, uid)
     upload = client.post(
@@ -274,27 +289,13 @@ def test_gate_passes_after_consent_and_cookies(client):
         headers=telegram_user_headers(uid),
     )
     assert resp.status_code == 201, resp.text
-    video_id = resp.json()["id"]
-
-    with SessionLocal() as db:
-        job = (
-            db.execute(
-                select(Job).where(Job.video_id == video_id, Job.kind == "download")
-            )
-            .scalars()
-            .one_or_none()
-        )
-        assert job is not None
-        assert job.status == "queued"
 
 
-def test_gate_ignores_admin_and_youtube_downloads(client, auth_headers):
-    # The operator is never gated...
+def test_admin_and_youtube_submissions_still_pass(client, auth_headers):
     resp = client.post(
         "/api/v1/videos", json={"source_url": TIKTOK_URL}, headers=auth_headers
     )
     assert resp.status_code == 201, resp.text
-    # ...and neither is a Telegram user on an un-gated platform.
     resp = client.post(
         "/api/v1/videos",
         json={"source_url": YOUTUBE_URL},
@@ -303,14 +304,13 @@ def test_gate_ignores_admin_and_youtube_downloads(client, auth_headers):
     assert resp.status_code == 201, resp.text
 
 
-def test_dedupe_still_fires_before_the_gate(client, auth_headers):
-    """A URL the caller can already see is returned, even before consent.
+def test_dedupe_still_fires_before_creation(client, auth_headers):
+    """A URL the caller can already see is returned, never duplicated.
 
-    Dedupe runs ahead of the cookie gate so re-pasting a known link never
-    demands cookies for a download that will not happen. The scope is what the
-    caller may read: a *public* unit is visible to any bot user, so the 409
-    (with the existing id) still fires for an un-gated one. A private unit does
-    not match — see `test_a_private_unit_is_not_disclosed_by_dedupe`.
+    Dedupe runs ahead of any cookie consideration, so re-pasting a known link
+    never creates a second row. The scope is what the caller may read: a
+    *public* unit is visible to any bot user, so the 409 (with the existing id)
+    still fires for one. A private unit does not match, see below.
     """
     folder = client.post(
         "/api/v1/folders",
@@ -328,7 +328,7 @@ def test_dedupe_still_fires_before_the_gate(client, auth_headers):
     resp = client.post(
         "/api/v1/videos",
         json={"source_url": TIKTOK_URL},
-        headers=telegram_user_headers(999),  # never consented
+        headers=telegram_user_headers(999),
     )
     assert resp.status_code == 409, resp.text
     body = resp.json()
@@ -339,8 +339,8 @@ def test_dedupe_still_fires_before_the_gate(client, auth_headers):
 def test_a_private_unit_is_not_disclosed_by_dedupe(client, auth_headers):
     """Dedupe must not be an oracle over someone else's private folder.
 
-    A bot user who never consented and holds no role on the folder gets the
-    consent gate (403), not the private video's id.
+    A bot user who holds no role on the folder simply creates a new unit; the
+    private video's id is never disclosed and cookies are not demanded.
     """
     folder = client.post(
         "/api/v1/folders",
@@ -360,51 +360,31 @@ def test_a_private_unit_is_not_disclosed_by_dedupe(client, auth_headers):
         json={"source_url": TIKTOK_URL},
         headers=telegram_user_headers(1001),
     )
-    assert resp.status_code == 403, resp.text
-    assert resp.json()["error"]["code"] == "consent_required"
-
-
-# ------------------------------------ the 403 says WHICH half of the gate failed
-
-
-def _gate_detail(resp) -> dict:
-    assert resp.status_code == 403, resp.text
-    error = resp.json()["error"]
-    assert error["code"] == "consent_required"
-    return error["details"][0]
-
-
-def test_gate_403_no_row_reports_both_halves_missing(client):
-    detail = _gate_detail(_gated_ingest(client, 7101))
-    assert detail["consented"] is False
-    assert detail["cookies_present"] is False
-
-
-def test_gate_403_unconsented_row_reports_consent_missing(client):
-    with SessionLocal() as db:
-        db.add(BotUser(telegram_user_id=7102))
-        db.commit()
-
-    detail = _gate_detail(_gated_ingest(client, 7102))
-    assert detail["consented"] is False
-    assert detail["cookies_present"] is False
-
-
-def test_gate_403_consented_without_file_reports_cookies_missing(client):
-    _consent(client, 7103)
-
-    detail = _gate_detail(_gated_ingest(client, 7103))
-    assert detail["consented"] is True
-    assert detail["cookies_present"] is False
-
-
-def test_gate_passes_when_consented_and_file_present(client):
-    uid = 7104
-    _consent(client, uid)
-    assert _upload(client, COOKIES_TXT.encode(), uid).status_code == 200
-
-    resp = _gated_ingest(client, uid)
     assert resp.status_code == 201, resp.text
+    assert resp.json()["id"] != created.json()["id"]
+
+
+# ------------------------------------------- the shared jar on BotUserOut
+
+
+def test_bot_user_out_reports_no_shared_jar_by_default(client, shared_cookies_path):
+    assert not shared_cookies_path.exists()
+    _consent(client)
+    body = client.get(
+        f"/api/v1/bot-users/{UID}", headers=telegram_user_headers(UID)
+    ).json()
+    assert body["shared_cookies_available"] is False
+
+
+def test_bot_user_out_reports_the_shared_jar_when_it_exists(
+    client, shared_cookies_path
+):
+    shared_cookies_path.write_text(COOKIES_TXT)
+    _consent(client)
+    body = client.get(
+        f"/api/v1/bot-users/{UID}", headers=telegram_user_headers(UID)
+    ).json()
+    assert body["shared_cookies_available"] is True
 
 
 # ------------------------------------------------- digest persistence (defect 2)

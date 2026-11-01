@@ -59,6 +59,11 @@ os.environ["WORKER_POLL_SECONDS"] = "0.2"
 os.environ["GEMINI_API_KEY"] = ""
 os.environ["LOGIN_RATE_LIMIT"] = "10000"
 os.environ["VIDEO_CREATE_RATE_LIMIT"] = "10000"
+# The per-actor quota counts every attempt (including validation failures), so
+# a test that posts several bad URLs under one actor would trip the default of
+# 5. Neutralise it suite-wide like the IP limit; the rate-limit tests lower it
+# explicitly via monkeypatch.
+os.environ["VIDEO_CREATE_ACTOR_RATE_LIMIT"] = "10000"
 # The developer's real .env (loaded by pydantic-settings) must not leak into
 # the suite: a configured bot username changes link-code responses, the same
 # way a real ADMIN_PASSWORD would change every login test.

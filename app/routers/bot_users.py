@@ -20,14 +20,12 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.auth import Principal
 from app.config import settings
 from app.db import get_db
 from app.errors import AppError
 from app.models import AdminUser, BotUser, LinkCode
 from app.roles import ADMIN_TIER
 from app.routers.passcodes import hash_code
-from app.security import detect_platform
 from app.services import storage
 
 logger = logging.getLogger("recsterio.bot_users")
@@ -37,10 +35,6 @@ router = APIRouter(prefix="/bot-users", tags=["bot-users"])
 # The consent text the bot showed the user. Bumping this invalidates every
 # earlier consent: the user must run /cookies again.
 CONSENT_VERSION = "2026-10-28.1"
-
-# Platforms that refuse an anonymous server, so the download must run under
-# the requesting user's own session (their uploaded cookies).
-SESSION_GATED_PLATFORMS = ("tiktok", "facebook")
 
 REQUESTED_BY_HEADER = "X-Requested-By"
 
@@ -89,6 +83,9 @@ class BotUserOut(BaseModel):
     consented_at: Optional[datetime] = None
     consent_version: Optional[str] = None
     cookies_present: bool
+    # Whether the operator's team-wide cookie jar exists. This is an optional
+    # fallback, never a precondition: the bot only mentions it in error copy.
+    shared_cookies_available: bool = False
     cookies_updated_at: Optional[datetime] = None
     # The console account this Telegram user is linked to (None when unlinked),
     # so the bot can say whose dataset a /link actually opened.
@@ -147,6 +144,7 @@ def _user_out(db: Session, telegram_id: int, row: Optional[BotUser]) -> BotUserO
         consented_at=row.consented_at if row is not None else None,
         consent_version=row.consent_version if row is not None else None,
         cookies_present=storage.cookie_file(telegram_id).exists(),
+        shared_cookies_available=storage.shared_cookies_file().exists(),
         cookies_updated_at=row.cookies_updated_at if row is not None else None,
         linked_email=linked.email if linked is not None else None,
         linked_name=linked.name if linked is not None else None,
@@ -452,45 +450,3 @@ def withdraw(
         db.commit()
     return Response(status_code=204)
 
-
-def require_session_consent(db: Session, principal: Principal, source_url: str) -> None:
-    """Gate TikTok/Facebook ingestion on the user's own consented session.
-
-    Called from `create_video` after the dedupe check: an already-known URL
-    is returned to anyone, but a *new* gated download must run under the
-    requesting user's cookies. The gate is keyed on the ACTOR, never the role:
-    a Telegram user linked to an active console account resolves to that
-    account's role (`admin`, `user`, ...), so `principal.role == "telegram"`
-    would silently exempt exactly the linked users from their own consent. A
-    `telegram:<digits>` actor is a person acting through the bot and must
-    consent; `telegram:bot` (the service identity) and every non-Telegram actor
-    pass untouched.
-    """
-    prefix = "telegram:"
-    if not principal.actor.startswith(prefix):
-        return
-    uid = principal.actor[len(prefix):]
-    if not uid.isdigit():
-        return  # "telegram:bot" is the service account, not a user session.
-    if detect_platform(source_url) not in SESSION_GATED_PLATFORMS:
-        return
-    row = _get_row(db, int(uid))
-    consented = bool(row.consented) if row is not None else False
-    cookies_present = storage.cookie_file(int(uid)).exists()
-    if consented and cookies_present:
-        return
-    raise AppError(
-        403,
-        "consent_required",
-        "Run /cookies in the bot to allow downloads with your own session.",
-        [
-            {
-                "field": "source_url",
-                "issue": "consent_required",
-                # Which half of the gate is missing, so the bot can word the
-                # hint precisely: agree to the consent, send the file, or both.
-                "consented": consented,
-                "cookies_present": cookies_present,
-            }
-        ],
-    )

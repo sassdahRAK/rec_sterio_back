@@ -513,6 +513,9 @@ def test_handle_download_passes_the_per_user_cookiefile(monkeypatch, tmp_path):
     cookie_path = tmp_path / "424242.txt"
     cookie_path.write_text("# Netscape HTTP Cookie File\n")
     monkeypatch.setattr(storage, "cookie_file", lambda uid: tmp_path / f"{uid}.txt")
+    monkeypatch.setattr(
+        storage, "shared_cookies_file", lambda: tmp_path / "shared_cookies.txt"
+    )
 
     def _enqueue_download(created_by: str) -> str:
         with SessionLocal() as db:
@@ -541,3 +544,58 @@ def test_handle_download_passes_the_per_user_cookiefile(monkeypatch, tmp_path):
         run_job(db, job)
         assert job.status == "succeeded", job.last_error
     assert captured["cookiefile"] is None
+
+
+def _run_download_for(monkeypatch, tmp_path, created_by: str) -> str | None:
+    """Run a download job and return the cookiefile option it used."""
+    captured = {}
+
+    def fake_download(source_url, video_id, on_progress=None, cookiefile=None):
+        captured["cookiefile"] = cookiefile
+        return DownloadResult(path=tmp_path / "media.mp4")
+
+    monkeypatch.setattr(downloader, "download", fake_download)
+    with SessionLocal() as db:
+        video = Video(
+            source_url=URL, platform="youtube", status="pending", created_by=created_by
+        )
+        db.add(video)
+        db.commit()
+        db.refresh(video)
+        job = queue.enqueue(db, "download", video_id=video.id, payload={"chain": []})
+        db.commit()
+        run_job(db, db.get(Job, job.id))
+        assert db.get(Job, job.id).status == "succeeded"
+    return captured["cookiefile"]
+
+
+def test_the_users_own_file_beats_the_shared_jar(monkeypatch, tmp_path):
+    user_file = tmp_path / "777.txt"
+    user_file.write_text("# Netscape HTTP Cookie File\n")
+    shared = tmp_path / "shared_cookies.txt"
+    shared.write_text("# shared\n")
+    monkeypatch.setattr(storage, "cookie_file", lambda uid: tmp_path / f"{uid}.txt")
+    monkeypatch.setattr(storage, "shared_cookies_file", lambda: shared)
+
+    used = _run_download_for(monkeypatch, tmp_path, "telegram:777")
+    assert used == str(user_file)
+
+
+def test_the_shared_jar_is_the_fallback_without_a_user_file(monkeypatch, tmp_path):
+    shared = tmp_path / "shared_cookies.txt"
+    shared.write_text("# shared\n")
+    monkeypatch.setattr(storage, "cookie_file", lambda uid: tmp_path / f"{uid}.txt")
+    monkeypatch.setattr(storage, "shared_cookies_file", lambda: shared)
+
+    used = _run_download_for(monkeypatch, tmp_path, "telegram:888")
+    assert used == str(shared)
+
+
+def test_no_cookie_option_at_all_when_neither_file_exists(monkeypatch, tmp_path):
+    monkeypatch.setattr(storage, "cookie_file", lambda uid: tmp_path / f"{uid}.txt")
+    monkeypatch.setattr(
+        storage, "shared_cookies_file", lambda: tmp_path / "missing_shared.txt"
+    )
+
+    used = _run_download_for(monkeypatch, tmp_path, "telegram:999")
+    assert used is None

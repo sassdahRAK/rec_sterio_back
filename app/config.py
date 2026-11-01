@@ -192,6 +192,12 @@ class Settings(BaseSettings):
     )
     video_create_rate_limit: int = 20  # per window
     video_create_rate_window: int = 60  # seconds
+    # Per-actor quota for the same route. Every Telegram request arrives from
+    # the bot host, so the IP bucket above is shared by the whole team; a
+    # resolved actor gets its own smaller budget, and the IP limit stays as a
+    # backstop against a compromised bot token. Guests and anonymous callers
+    # are not keyed (they have no stable person) and use the IP limit alone.
+    video_create_actor_rate_limit: int = 5  # per actor per window
     login_rate_limit: int = 10
     login_rate_window: int = 60
     # Passcode / share-link redemption is the public brute-force surface: a

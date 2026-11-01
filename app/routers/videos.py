@@ -35,7 +35,6 @@ from app.config import settings
 from app.db import get_db
 from app.errors import AppError
 from app.models import DriveLink, Folder, Job, Merge, Transcript, Video
-from app.routers.bot_users import require_session_consent
 from app.schemas import (
     JobOut,
     PortalLinkOut,
@@ -293,6 +292,17 @@ def create_video(
         settings.video_create_rate_limit,
         settings.video_create_rate_window,
     )
+    # Per-actor quota, keyed on the resolved principal. All Telegram traffic
+    # shares the bot host's client IP, so the IP bucket above is one team-wide
+    # budget; this gives each person their own so one first-time user cannot
+    # starve the others. The IP limiter above remains the backstop. Guests and
+    # anonymous callers have no stable actor, so they use the IP limit only.
+    if principal.actor and not principal.is_guest:
+        enforce_rate_limit(
+            f"video_create_actor:{principal.actor}",
+            settings.video_create_actor_rate_limit,
+            settings.video_create_rate_window,
+        )
     source_url = validate_source_url(payload.source_url)
     if payload.folder_id is not None:
         folder = db.get(Folder, payload.folder_id)
@@ -345,11 +355,10 @@ def create_video(
             "This link is already in the dataset.",
         )
 
-    # TikTok/Facebook answer an anonymous server with a bot check, so a new
-    # gated download must run under the requesting user's own session: they
-    # need to have consented and uploaded their cookies through the bot.
-    require_session_consent(db, principal, source_url)
-
+    # Cookies are an optional override, never a precondition. The worker picks
+    # the requesting user's own file when one exists and falls back to the
+    # operator's shared jar otherwise; a download with neither still runs (the
+    # platform may allow it) and only fails, if it does, at the download step.
     position = 0
     if payload.folder_id is not None:
         position = db.execute(

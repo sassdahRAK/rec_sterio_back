@@ -10,7 +10,7 @@ The fix splits the two by actor: only `telegram:bot` keeps the blanket grant;
 `telegram:<uid>` resolves to the linked active console account's role, or to a
 bare `telegram` principal with no blanket access. These tests pin the contrast
 from both sides — the person is refused, the bot still works — plus the
-server-side link resolution and the actor-based consent gate.
+server-side link resolution. Cookies never gate a submission.
 """
 from __future__ import annotations
 
@@ -178,12 +178,11 @@ def test_a_linked_ordinary_user_does_not_become_an_editor(client, auth_headers):
     )
 
 
-# ------------------------------------------------------------- consent gate
+# ------------------------------------------- cookies are not a precondition
 
 
-def test_a_linked_admin_still_hits_the_consent_gate(client):
-    """The TikTok/Facebook consent gate keys on the ACTOR, not the role, so a
-    linked admin cannot skip the cookies requirement by resolving as admin."""
+def test_a_linked_admin_can_submit_without_cookies(client):
+    """Nobody is gated: a linked admin needs no consent row and no cookies."""
     uid = 555201
     _link(uid, "admin")
     resp = client.post(
@@ -193,5 +192,5 @@ def test_a_linked_admin_still_hits_the_consent_gate(client):
         },
         headers=telegram_user_headers(uid),
     )
-    assert resp.status_code == 403, resp.text
-    assert resp.json()["error"]["code"] == "consent_required", resp.text
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["created_by"] == f"telegram:{uid}"

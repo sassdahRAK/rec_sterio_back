@@ -168,8 +168,8 @@ def bot_headers() -> dict:
 def telegram_user_headers(uid: int) -> dict:
     """A Telegram user acting through the bot: service token + own id.
 
-    Both credentials are what the /bot-users routes (and the consent gate)
-    require — the token alone is the bot's identity, not the user's.
+    Both credentials are what the /bot-users routes require. The token alone
+    is the bot's identity, not the user's.
     """
     from app.config import settings
 

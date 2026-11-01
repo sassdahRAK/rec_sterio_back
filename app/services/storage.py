@@ -48,6 +48,18 @@ def cookie_file(telegram_id: int) -> Path:
     return cookies_root() / f"{telegram_id}.txt"
 
 
+def shared_cookies_file() -> Path:
+    """The operator-managed team cookie jar, next to the per-user directory.
+
+    Dropping one valid Netscape export here turns on the team-wide fallback:
+    a consented member with no file of their own then downloads under this
+    session instead of being asked for a cookies.txt. Existence is the feature
+    switch, so nothing creates the file automatically. It is read-only for
+    everyone; a member's own uploaded file, when present, always wins.
+    """
+    return cookies_root().parent / "shared_cookies.txt"
+
+
 def media_file(video_id: UUID | str, ext: str | None = None) -> Path:
     d = video_dir(video_id)
     if ext:
