@@ -38,6 +38,9 @@ __all__ = [
     "ensure_app_folder",
     "create_upload_target",
     "open_download",
+    "list_files",
+    "delete_file",
+    "move_file",
     "encrypt_token",
     "decrypt_token",
 ]
@@ -78,6 +81,8 @@ ONEDRIVE_SCOPE = (
     "offline_access https://graph.microsoft.com/Files.ReadWrite.AppFolder "
     "https://graph.microsoft.com/User.Read"
 )
+
+MICROSOFT_GRAPH_ITEM_URL = "https://graph.microsoft.com/v1.0/me/drive/items/{file_id}"
 
 PROVIDER_NAMES = ("google", "onedrive")
 
@@ -750,3 +755,151 @@ def open_download(
         size=size,
         body=body,
     )
+
+
+# ------------------------------------------------- maintenance (delete / move)
+#
+# Deleting a video row is supposed to delete its bytes too. Before these
+# helpers the app only ever issued GET/POST, so every remote copy of a deleted
+# unit stayed behind in the contributor's Drive forever. The same applies to
+# files that were uploaded before the folder-parent fix: they sit in My Drive
+# root and have to be moved into the app folder without re-uploading them.
+
+
+def _check_provider(provider: str) -> None:
+    # The value is not echoed: it is caller-supplied on some paths, and an
+    # error message must not become a way to write arbitrary text into a log.
+    if provider not in PROVIDER_NAMES:
+        raise AppError(
+            400, "provider_not_supported", "Unknown storage provider; expected 'google' or 'onedrive'."
+        )
+
+
+def _item_url(provider: str, file_id: str) -> str:
+    """The item-metadata URL for one file.
+
+    The id is percent-encoded: it arrives from a provider or a caller and must
+    never be able to add path segments or a query string of its own.
+    """
+    encoded = _urlparse.quote(file_id, safe="")
+    if provider == "google":
+        return f"{GOOGLE_FILES_URL}/{encoded}"
+    return MICROSOFT_GRAPH_ITEM_URL.format(file_id=encoded)
+
+
+def delete_file(provider: str, access_token: str, file_id: str) -> None:
+    """Delete one file from the contributor's drive.
+
+    A 404 is success: the file is already gone, which is exactly the state the
+    caller wants, and a retry after a timeout must not look like a failure.
+    Everything else that is not 2xx is `upstream` — the provider is having
+    trouble, not the caller, and the caller (the delete route) treats it as
+    best-effort.
+    """
+    _check_provider(provider)
+    status, _, _ = http_json(
+        "DELETE",
+        _item_url(provider, file_id),
+        headers=_bearer(access_token),
+    )
+    if status == 404:
+        return
+    if status >= 400:
+        raise upstream(provider, f"file delete answered {status}")
+
+
+def move_file(
+    provider: str,
+    access_token: str,
+    file_id: str,
+    new_parent_id: str,
+    old_parent_id: Optional[str] = None,
+) -> None:
+    """Move one file into another folder, keeping its content and id.
+
+    Google takes the old and new parent as query parameters on a `PATCH`;
+    `removeParents` is omitted when the old parent is unknown (the API then
+    adds the new parent without detaching one, which a list of parents can
+    afford). OneDrive takes the target folder as the `parentReference` body
+    field; its app-folder scope means the value is the approot item id.
+
+    Unlike `delete_file`, a 404 here is an error rather than a no-op: the
+    caller asked for the file to end up somewhere, and it cannot verify that.
+    """
+    _check_provider(provider)
+    url = _item_url(provider, file_id)
+    headers = {**_bearer(access_token), "Content-Type": "application/json"}
+    if provider == "google":
+        params: Dict[str, str] = {"addParents": new_parent_id, "fields": "id,parents"}
+        if old_parent_id:
+            params["removeParents"] = old_parent_id
+        status, _, _ = http_json(
+            "PATCH",
+            f"{url}?{_urlparse.urlencode(params)}",
+            headers=headers,
+            json_body={},
+        )
+    else:
+        status, _, _ = http_json(
+            "PATCH",
+            url,
+            headers=headers,
+            json_body={"parentReference": {"id": new_parent_id}},
+        )
+    if status >= 400:
+        raise upstream(provider, f"file move answered {status}")
+
+
+def list_files(
+    provider: str,
+    access_token: str,
+    page_size: int = 1000,
+    max_pages: int = 10,
+) -> list[Dict[str, Any]]:
+    """Every non-trashed file this app can see, following page tokens.
+
+    `q=trashed=false` is the widest listing the grant allows: Google's
+    `drive.file` scope only ever exposes files this app created. `max_pages`
+    bounds the walk so a pathological drive cannot hold a request open
+    forever; the sweep reports the count it actually scanned.
+
+    Google only: OneDrive's `Files.ReadWrite.AppFolder` has no folder listing
+    the app can address by id (the approot is implicit), so the sweep refuses
+    that provider rather than pretending an empty result is a clean drive.
+    """
+    _check_provider(provider)
+    if provider != "google":
+        raise AppError(
+            400,
+            "provider_not_supported",
+            "Listing is only supported for Google Drive; OneDrive stores files "
+            "in an app-private folder that cannot be scanned the same way.",
+        )
+    collected: list[Dict[str, Any]] = []
+    page_token: Optional[str] = None
+    for _ in range(max_pages):
+        params: Dict[str, str] = {
+            "q": "trashed=false",
+            "fields": "nextPageToken,files(id,name,size,parents,mimeType)",
+            "pageSize": str(page_size),
+            "spaces": "drive",
+        }
+        if page_token:
+            params["pageToken"] = page_token
+        status, _, data = http_json(
+            "GET",
+            f"{GOOGLE_FILES_URL}?{_urlparse.urlencode(params)}",
+            headers=_bearer(access_token),
+            timeout=30.0,
+        )
+        if status >= 400:
+            raise upstream("google", f"file listing answered {status}")
+        if not isinstance(data, dict):
+            break
+        for entry in data.get("files") or []:
+            if isinstance(entry, dict):
+                collected.append(entry)
+        page_token = data.get("nextPageToken")
+        if not page_token:
+            break
+    return collected

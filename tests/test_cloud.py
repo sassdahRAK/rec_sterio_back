@@ -821,3 +821,385 @@ def test_a_dead_drive_reports_unavailable_not_a_500(client, drive_config, monkey
     monkeypatch.setattr(cloud_providers, "refresh_access_token", _boom)
     resp = client.get(f"{API}/videos/{start['video_id']}/media", headers=admin)
     assert resp.status_code in (400, 404), resp.status_code
+
+
+# ------------------------------------------------- provider maintenance calls
+#
+# Every test below fails on the pre-change code: `delete_file`/`move_file`/
+# `list_files` did not exist (AttributeError), `DELETE /videos/{id}` never
+# touched the provider, and `/cloud/maintenance/orphans` was a 404 route.
+# These exercise the real functions against a fake `http_json`, the same way
+# the upload tests fake `http_bytes`.
+
+
+def _recording_http_json(monkeypatch, status: int = 204, body=None):
+    calls = []
+
+    def _json(method, url, *, headers=None, json_body=None, data=None, timeout=30.0):
+        calls.append({"method": method, "url": url, "headers": headers, "body": json_body})
+        return status, {}, body if body is not None else {}
+
+    monkeypatch.setattr(cloud_providers, "http_json", _json)
+    return calls
+
+
+def test_delete_file_sends_delete_to_google_and_treats_404_as_success(monkeypatch):
+    from app.errors import AppError
+
+    calls = _recording_http_json(monkeypatch)
+    cloud_providers.delete_file(GOOGLE, "access-g", "file-1")
+
+    assert len(calls) == 1
+    assert calls[0]["method"] == "DELETE"
+    assert calls[0]["url"] == "https://www.googleapis.com/drive/v3/files/file-1"
+    assert calls[0]["headers"]["Authorization"] == "Bearer access-g"
+
+    # Already gone: the state the caller wants, so no error.
+    monkeypatch.setattr(cloud_providers, "http_json", lambda *a, **k: (404, {}, {}))
+    cloud_providers.delete_file(GOOGLE, "access-g", "file-gone")
+
+    # Any other non-2xx is an upstream failure (502), never a silent success.
+    monkeypatch.setattr(cloud_providers, "http_json", lambda *a, **k: (500, {}, {}))
+    with pytest.raises(AppError) as excinfo:
+        cloud_providers.delete_file(GOOGLE, "access-g", "file-1")
+    assert excinfo.value.status_code == 502
+    assert excinfo.value.code == "upstream_error"
+
+
+def test_delete_file_targets_the_graph_item_on_onedrive(monkeypatch):
+    calls = _recording_http_json(monkeypatch)
+    cloud_providers.delete_file(ONEDRIVE, "access-m", "item-7")
+
+    assert calls[0]["method"] == "DELETE"
+    assert calls[0]["url"] == "https://graph.microsoft.com/v1.0/me/drive/items/item-7"
+
+    monkeypatch.setattr(cloud_providers, "http_json", lambda *a, **k: (404, {}, {}))
+    cloud_providers.delete_file(ONEDRIVE, "access-m", "item-gone")
+
+
+def test_move_file_patches_parents_on_google(monkeypatch):
+    calls = _recording_http_json(
+        monkeypatch, status=200, body={"id": "file-1", "parents": ["folder-new"]}
+    )
+    cloud_providers.move_file(GOOGLE, "access-g", "file-1", "folder-new", "folder-old")
+
+    method, url = calls[0]["method"], calls[0]["url"]
+    assert method == "PATCH"
+    parsed = urlparse(url)
+    assert parsed.path == "/drive/v3/files/file-1"
+    params = parse_qs(parsed.query)
+    assert params["addParents"] == ["folder-new"]
+    assert params["removeParents"] == ["folder-old"]
+    assert params["fields"] == ["id,parents"]
+
+    # Without an old parent the parameter is omitted, not sent empty.
+    calls.clear()
+    cloud_providers.move_file(GOOGLE, "access-g", "file-1", "folder-new")
+    params = parse_qs(urlparse(calls[0]["url"]).query)
+    assert params["addParents"] == ["folder-new"]
+    assert "removeParents" not in params
+
+
+def test_move_file_sends_a_parent_reference_on_onedrive(monkeypatch):
+    calls = _recording_http_json(monkeypatch, status=200, body={"id": "item-1"})
+    cloud_providers.move_file(ONEDRIVE, "access-m", "item-1", "folder-new")
+
+    assert calls[0]["method"] == "PATCH"
+    assert calls[0]["url"] == "https://graph.microsoft.com/v1.0/me/drive/items/item-1"
+    assert calls[0]["body"] == {"parentReference": {"id": "folder-new"}}
+
+
+# ------------------------------------------------------ deleting a cloud row
+
+
+def test_delete_video_deletes_the_provider_copy_and_returns_204(
+    client, drive_config, monkeypatch
+):
+    admin = _admin(client)
+    _fake_download(monkeypatch)
+    video_id = _complete_cloud_video(client, admin, monkeypatch)
+
+    reclaims = []
+    monkeypatch.setattr(
+        cloud_providers,
+        "delete_file",
+        lambda provider, access, file_id: reclaims.append((provider, access, file_id)),
+    )
+
+    resp = client.delete(f"{API}/videos/{video_id}", headers=admin)
+
+    assert resp.status_code == 204, resp.text
+    assert reclaims == [(GOOGLE, "access-google", "file-1")]
+    with SessionLocal() as db:
+        assert db.get(Video, video_id) is None
+
+
+def test_delete_video_without_a_drive_link_still_204_and_warns(
+    client, drive_config, monkeypatch, caplog
+):
+    """The exact shape of today's orphans: the link is gone, the bytes are not.
+
+    On the old code this passed too (it never touched the provider) — but it
+    passed silently. The assertion below is what is new: the loss is logged.
+    """
+    admin = _admin(client)
+    _fake_download(monkeypatch)
+    video_id = _complete_cloud_video(client, admin, monkeypatch)
+    with SessionLocal() as db:
+        video = db.get(Video, video_id)
+        video.drive_link_id = None  # what the FK does when the link row goes
+        db.commit()
+
+    monkeypatch.setattr(
+        cloud_providers,
+        "delete_file",
+        lambda *a, **k: pytest.fail("no link: the provider must not be called"),
+    )
+    with caplog.at_level(logging.WARNING, logger="recsterio.videos"):
+        resp = client.delete(f"{API}/videos/{video_id}", headers=admin)
+
+    assert resp.status_code == 204, resp.text
+    assert any("unreclaimed" in record.message for record in caplog.records)
+    with SessionLocal() as db:
+        assert db.get(Video, video_id) is None
+
+
+def test_delete_video_survives_a_provider_failure(client, drive_config, monkeypatch, caplog):
+    """Best-effort by contract: provider trouble must not abort the delete."""
+    from app.errors import AppError
+
+    admin = _admin(client)
+    _fake_download(monkeypatch)
+    video_id = _complete_cloud_video(client, admin, monkeypatch)
+
+    def _boom(provider, access, file_id):
+        raise AppError(502, "upstream_error", "google file delete answered 500.")
+
+    monkeypatch.setattr(cloud_providers, "delete_file", _boom)
+    with caplog.at_level(logging.WARNING, logger="recsterio.videos"):
+        resp = client.delete(f"{API}/videos/{video_id}", headers=admin)
+
+    assert resp.status_code == 204, resp.text
+    assert any("unreclaimed" in record.message for record in caplog.records)
+    with SessionLocal() as db:
+        assert db.get(Video, video_id) is None
+
+
+# --------------------------------------------------------------- orphan sweep
+
+APP_FOLDER_ID = "1ldFvR1-I5lPE8SVS2laAI0iNDFugMDsi"
+
+
+def _cloud_row(db_file_id: str, link_id=None) -> None:
+    """A `videos` row that points at a provider file (no bytes needed)."""
+    with SessionLocal() as db:
+        db.add(
+            Video(
+                source_url="upload://clip.mp4",
+                platform="direct",
+                status="ready",
+                storage_backend=GOOGLE,
+                drive_file_id=db_file_id,
+                drive_link_id=link_id,
+            )
+        )
+        db.commit()
+
+
+def _fake_sweep_provider(monkeypatch, files):
+    """Stub every provider call the sweep makes and record the mutations."""
+    calls = {"deleted": [], "moved": [], "listed": 0}
+    monkeypatch.setattr(cloud_providers, "refresh_access_token", lambda p, rt: "access-google")
+    monkeypatch.setattr(
+        cloud_providers, "ensure_app_folder", lambda *a, **k: APP_FOLDER_ID
+    )
+
+    def _list(provider, access, **kwargs):
+        calls["listed"] += 1
+        return files
+
+    monkeypatch.setattr(cloud_providers, "list_files", _list)
+    monkeypatch.setattr(
+        cloud_providers, "delete_file", lambda p, a, f: calls["deleted"].append(f)
+    )
+    monkeypatch.setattr(
+        cloud_providers,
+        "move_file",
+        lambda p, a, f, new, old=None: calls["moved"].append((f, new, old)),
+    )
+    return calls
+
+
+_SWEEP_FILES = [
+    # The folder itself is never classified.
+    {"id": APP_FOLDER_ID, "name": "RecSterio", "mimeType": cloud_providers.GOOGLE_FOLDER_MIME},
+    # Orphan, correctly filed: delete.
+    {"id": "file-orphan", "name": "a.mp4", "size": "10", "parents": [APP_FOLDER_ID]},
+    # Orphan in My Drive root: delete (the legacy misplaced-upload bug).
+    {"id": "file-both", "name": "b.mp4", "size": "20", "parents": []},
+    # Referenced but in root: move, never delete.
+    {"id": "file-misplaced", "name": "c.mp4", "size": "30", "parents": ["root"]},
+    # Referenced and correctly filed: untouched.
+    {"id": "file-ok", "name": "d.mp4", "size": "40", "parents": [APP_FOLDER_ID]},
+]
+
+
+def test_orphan_sweep_dry_run_reports_the_plan_and_touches_nothing(
+    client, drive_config, monkeypatch
+):
+    admin = _admin(client)
+    link = _connect(client, admin, GOOGLE, "me@gmail.com", monkeypatch)
+    _cloud_row("file-misplaced")
+    _cloud_row("file-ok")
+    calls = _fake_sweep_provider(monkeypatch, _SWEEP_FILES)
+
+    resp = client.get(
+        f"{API}/cloud/maintenance/orphans",
+        params={"link_id": link["id"]},
+        headers=admin,
+    )
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["scanned"] == 4  # the folder entry is not a file
+    assert body["orphans"] == 2  # file-orphan + file-both
+    assert body["misplaced"] == 2  # file-both + file-misplaced
+    assert body["app_folder_id"] == APP_FOLDER_ID
+    reasons = {item["file_id"]: item["reason"] for item in body["plan"]}
+    assert reasons == {
+        "file-orphan": "orphan",
+        "file-both": "both",
+        "file-misplaced": "misplaced",
+    }
+    by_id = {item["file_id"]: item for item in body["plan"]}
+    assert by_id["file-orphan"]["name"] == "a.mp4"
+    assert by_id["file-orphan"]["size"] == 10
+    # A dry run is a read: no delete, no move.
+    assert calls["deleted"] == []
+    assert calls["moved"] == []
+
+
+def test_orphan_sweep_requires_the_confirmation_phrase(
+    client, drive_config, monkeypatch
+):
+    admin = _admin(client)
+    link = _connect(client, admin, GOOGLE, "me@gmail.com", monkeypatch)
+    calls = _fake_sweep_provider(monkeypatch, _SWEEP_FILES)
+
+    for body in ({}, {"confirm": ""}, {"confirm": "yes"}):
+        resp = client.post(
+            f"{API}/cloud/maintenance/orphans",
+            params={"link_id": link["id"]},
+            json=body,
+            headers=admin,
+        )
+        assert resp.status_code in (400, 422), resp.text
+        if resp.status_code == 400:
+            assert resp.json()["error"]["code"] == "confirmation_required"
+
+    assert calls["deleted"] == []
+    assert calls["moved"] == []
+    assert calls["listed"] == 0  # refused before any provider call
+
+
+def test_orphan_sweep_deletes_orphans_and_moves_referenced_misplaced_files(
+    client, drive_config, monkeypatch
+):
+    admin = _admin(client)
+    link = _connect(client, admin, GOOGLE, "me@gmail.com", monkeypatch)
+    _cloud_row("file-misplaced")
+    _cloud_row("file-ok")
+    calls = _fake_sweep_provider(monkeypatch, _SWEEP_FILES)
+
+    resp = client.post(
+        f"{API}/cloud/maintenance/orphans",
+        params={"link_id": link["id"]},
+        json={"confirm": "delete-orphans"},
+        headers=admin,
+    )
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["scanned"] == 4
+    assert body["deleted"] == 2
+    assert body["moved"] == 1
+    assert body["failed"] == []
+    # The two orphans are deleted...
+    assert sorted(calls["deleted"]) == ["file-both", "file-orphan"]
+    # ...the referenced root file is moved into the app folder, not deleted,
+    # with its old parent detached so it really leaves My Drive root...
+    assert calls["moved"] == [("file-misplaced", APP_FOLDER_ID, "root")]
+    # ...and a referenced file that is filed correctly is never touched.
+    assert "file-ok" not in calls["deleted"]
+    assert all(file_id != "file-ok" for file_id, _, _ in calls["moved"])
+
+
+def test_orphan_sweep_records_a_provider_failure_and_keeps_going(
+    client, drive_config, monkeypatch
+):
+    from app.errors import AppError
+
+    admin = _admin(client)
+    link = _connect(client, admin, GOOGLE, "me@gmail.com", monkeypatch)
+    _cloud_row("file-misplaced")
+    _cloud_row("file-ok")
+    calls = _fake_sweep_provider(monkeypatch, _SWEEP_FILES)
+
+    def _delete(provider, access, file_id):
+        if file_id == "file-both":
+            raise AppError(502, "upstream_error", "google file delete answered 500.")
+        calls["deleted"].append(file_id)
+
+    monkeypatch.setattr(cloud_providers, "delete_file", _delete)
+    resp = client.post(
+        f"{API}/cloud/maintenance/orphans",
+        params={"link_id": link["id"]},
+        json={"confirm": "delete-orphans"},
+        headers=admin,
+    )
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["deleted"] == 1
+    assert body["moved"] == 1
+    assert [f["file_id"] for f in body["failed"]] == ["file-both"]
+    assert "500" in body["failed"][0]["error"]
+
+
+def test_orphan_sweep_is_super_admin_only(client, drive_config, monkeypatch):
+    admin = _admin(client)
+    link = _connect(client, admin, GOOGLE, "me@gmail.com", monkeypatch)
+    calls = _fake_sweep_provider(monkeypatch, _SWEEP_FILES)
+    plain = user_headers(ensure_user("sweeper"))
+
+    assert (
+        client.get(
+            f"{API}/cloud/maintenance/orphans",
+            params={"link_id": link["id"]},
+            headers=plain,
+        ).status_code
+        == 403
+    )
+    resp = client.post(
+        f"{API}/cloud/maintenance/orphans",
+        params={"link_id": link["id"]},
+        json={"confirm": "delete-orphans"},
+        headers=plain,
+    )
+    assert resp.status_code == 403, resp.text
+    assert resp.json()["error"]["code"] == "forbidden"
+    assert calls["deleted"] == []
+    assert calls["moved"] == []
+    assert calls["listed"] == 0
+
+
+def test_orphan_sweep_rejects_an_unknown_link(client, drive_config, monkeypatch):
+    admin = _admin(client)
+    _fake_sweep_provider(monkeypatch, _SWEEP_FILES)
+    resp = client.get(
+        f"{API}/cloud/maintenance/orphans",
+        params={"link_id": str(uuid4())},
+        headers=admin,
+    )
+    assert resp.status_code == 404, resp.text
+    assert resp.json()["error"]["code"] == "not_found"

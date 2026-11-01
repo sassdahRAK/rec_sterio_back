@@ -825,6 +825,54 @@ def update_video(
     return VideoOut.model_validate(video)
 
 
+def _reclaim_cloud_bytes(
+    db: Session,
+    backend: Optional[str],
+    file_id: Optional[str],
+    link_id: Optional[UUID],
+) -> None:
+    """Best-effort delete of a deleted row's bytes on the contributor's drive.
+
+    Called *after* the DB delete commits. Two reasons:
+
+    * the user's intent (remove the unit) must win over provider trouble, so
+      no provider failure may abort the delete or answer 500 — the response
+      code is already fixed by then;
+    * a file we fail to reclaim is not lost work: it is exactly the orphan the
+      maintenance sweep (`GET/POST /cloud/maintenance/orphans`) deletes.
+
+    A row with no usable link is the case that created the current orphans
+    (the contributor disconnected, or uploaded before `drive_link_id` was
+    recorded): warn, never fail. Before this existed the remote copy was never
+    touched at all, so every cloud deletion leaked a file.
+    """
+    if not backend or not file_id:
+        return
+    link = db.get(DriveLink, link_id) if link_id else None
+    if link is None:
+        logger.warning(
+            "deleted cloud video left %s file %s unreclaimed: its drive link "
+            "(%s) is gone — the orphan sweep can reclaim it",
+            backend,
+            file_id,
+            link_id or "unset",
+        )
+        return
+    try:
+        access = cloud_providers.refresh_access_token(
+            backend, decrypt_token(link.refresh_token)
+        )
+        cloud_providers.delete_file(backend, access, file_id)
+    except Exception as exc:  # noqa: BLE001 — best-effort is the contract here
+        # Never re-raise: the row is already gone and the caller gets its 204.
+        logger.warning(
+            "deleted cloud video left %s file %s unreclaimed: %s",
+            backend,
+            file_id,
+            exc,
+        )
+
+
 @router.delete("/{video_id}", status_code=204)
 def delete_video(
     video_id: UUID,
@@ -833,11 +881,18 @@ def delete_video(
 ) -> Response:
     video = get_video_or_404(db, video_id)
     require_media_editor(db, video, principal)
+    # Snapshot the cloud coordinates before the row goes away: after
+    # `db.commit()` the ORM object is deleted and every attribute read would
+    # raise. Both are None for a local-only video, which skips the reclamation.
+    backend = video.storage_backend
+    remote_file_id = video.drive_file_id
+    link_id = video.drive_link_id
     db.execute(Transcript.__table__.delete().where(Transcript.video_id == video_id))
     db.execute(Merge.__table__.delete().where(Merge.video_id == video_id))
     db.execute(Job.__table__.delete().where(Job.video_id == video_id))
     db.delete(video)
     db.commit()
+    _reclaim_cloud_bytes(db, backend, remote_file_id, link_id)
     storage.delete_video_files(video_id)
     return Response(status_code=204)
 

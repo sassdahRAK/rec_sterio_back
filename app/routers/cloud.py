@@ -24,16 +24,17 @@ from pathlib import Path
 from typing import Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app import schemas
+from app.access import require_super_admin
 from app.schemas import CompleteCloudUploadIn
 from app.auth import Principal, get_principal
 from app.config import settings
 from app.db import get_db
-from app.errors import AppError
+from app.errors import AppError, upstream
 from app.models import AdminUser, DriveLink, Video
 from app.services import asr, cloud_providers, storage
 from app.services.cloud_providers import decrypt_token, encrypt_token
@@ -372,3 +373,233 @@ def complete_cloud_upload(
         logger.exception("cloud upload completion failed for %s", video_id)
         temp_media.unlink(missing_ok=True)
         raise AppError(500, "cloud_upload_failed", "Could not process the uploaded file from your drive.")
+
+
+# --------------------------------------------------------- orphan sweep (admin)
+#
+# Two kinds of file accumulate in a contributor's drive and the app never
+# noticed either:
+#
+#   * deletions used to remove only the `videos` row, so the provider copy
+#     stayed behind — an **orphan** (no row references it);
+#   * uploads made before the `parents` fix landed the bytes in My Drive root
+#     instead of the app folder — **misplaced** (a row still needs it).
+#
+# This surface classifies every file against `videos.drive_file_id`. The dry
+# run is a plain GET; the destructive run needs an explicit confirmation
+# phrase, because it deletes files the user can never get back through the
+# API. It is deliberately the super admin's alone: it reaches across every
+# account's drive, which user management does too.
+
+SWEEP_CONFIRM = "delete-orphans"
+
+
+def _int_or_none(value) -> Optional[int]:
+    """Drive reports `size` as a string; a folder has no size at all."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _sweep_candidates(files: list[dict]) -> list[dict]:
+    """The listed entries the sweep may classify: real files with an id.
+
+    Folders are skipped (the app folder itself is excluded by id as well):
+    deleting a folder would take its contents with it without classifying
+    them, and the app never creates sub-folders of its own.
+    """
+    return [
+        entry
+        for entry in files
+        if entry.get("id") and entry.get("mimeType") != cloud_providers.GOOGLE_FOLDER_MIME
+    ]
+
+
+def _plan_sweep(
+    candidates: list[dict], app_folder_id: str, referenced: set[str]
+) -> list[dict]:
+    """Classify each candidate as orphan / misplaced / both.
+
+    `referenced` is every `videos.drive_file_id` in the database, so a file a
+    row points at is never an orphan — whatever else is wrong with it, the
+    sweep moves it rather than deleting it.
+    """
+    plan: list[dict] = []
+    for entry in candidates:
+        file_id = entry["id"]
+        if file_id == app_folder_id:
+            continue
+        orphan = file_id not in referenced
+        misplaced = app_folder_id not in (entry.get("parents") or [])
+        if orphan and misplaced:
+            reason = "both"
+        elif orphan:
+            reason = "orphan"
+        elif misplaced:
+            reason = "misplaced"
+        else:
+            continue
+        plan.append(
+            {
+                "file_id": file_id,
+                "name": entry.get("name"),
+                "size": _int_or_none(entry.get("size")),
+                "reason": reason,
+            }
+        )
+    return plan
+
+
+def _sweep_target(link_id: UUID, db: Session):
+    """Resolve one connected drive to (link, access token, app folder id)."""
+    link = db.get(DriveLink, link_id)
+    if link is None:
+        raise AppError(
+            404, "not_found", "That drive is not connected.",
+            [{"link_id": str(link_id)}],
+        )
+    if link.provider != "google":
+        # OneDrive files live in an app-private folder that cannot be listed
+        # by id, so there is nothing comparable to classify there.
+        raise AppError(
+            400, "provider_not_supported",
+            "The orphan sweep supports Google Drive only.",
+            [{"provider": link.provider}],
+        )
+    access = cloud_providers.refresh_access_token(
+        link.provider, decrypt_token(link.refresh_token)
+    )
+    # Reused from the upload path: find the app folder, creating it once if it
+    # is missing. Without its id a "misplaced" file cannot be told apart from
+    # a correctly filed one, so a resolution failure is a 502, not a guess.
+    folder_id = cloud_providers.ensure_app_folder(access)
+    if not folder_id:
+        raise upstream(
+            "google",
+            "the app folder could not be resolved, so a sweep cannot tell a "
+            "misplaced file from a filed one",
+        )
+    return link, access, folder_id
+
+
+def _referenced_drive_files(db: Session) -> set[str]:
+    """Every provider file id any `videos` row points at."""
+    return {
+        file_id
+        for file_id in db.execute(
+            select(Video.drive_file_id).where(Video.drive_file_id.is_not(None))
+        ).scalars()
+        if file_id
+    }
+
+
+@router.get("/maintenance/orphans", response_model=schemas.CloudOrphanPlan)
+def list_orphans(
+    link_id: UUID = Query(
+        ...,
+        description="Connected Google Drive to inspect (`id` from GET /cloud/links).",
+    ),
+    db: Session = Depends(get_db),
+    principal: Principal = Depends(get_principal),
+) -> schemas.CloudOrphanPlan:
+    """Dry run: what a sweep of this drive would delete and move. Changes nothing."""
+    require_super_admin(principal)
+    link, access, folder_id = _sweep_target(link_id, db)
+    candidates = _sweep_candidates(cloud_providers.list_files(link.provider, access))
+    plan = _plan_sweep(candidates, folder_id, _referenced_drive_files(db))
+    return schemas.CloudOrphanPlan(
+        link_id=link.id,
+        provider=link.provider,
+        app_folder_id=folder_id,
+        scanned=len(candidates),
+        orphans=sum(1 for item in plan if item["reason"] in ("orphan", "both")),
+        misplaced=sum(1 for item in plan if item["reason"] in ("misplaced", "both")),
+        plan=[schemas.CloudOrphanFile(**item) for item in plan],
+    )
+
+
+@router.post("/maintenance/orphans", response_model=schemas.CloudSweepResult)
+def run_orphan_sweep(
+    payload: schemas.CloudSweepIn,
+    link_id: UUID = Query(
+        ...,
+        description="Connected Google Drive to sweep (`id` from GET /cloud/links).",
+    ),
+    db: Session = Depends(get_db),
+    principal: Principal = Depends(get_principal),
+) -> schemas.CloudSweepResult:
+    """Destructive run: delete orphans, move misplaced referenced files.
+
+    The confirmation phrase is checked before any provider call, so a
+    mistyped or accidental request cannot partially act. Each file is handled
+    on its own: one failure is recorded in `failed` and the sweep continues,
+    so a single unreadable item never strands the rest.
+    """
+    require_super_admin(principal)
+    if payload.confirm != SWEEP_CONFIRM:
+        raise AppError(
+            400,
+            "confirmation_required",
+            f'Send {{"confirm": "{SWEEP_CONFIRM}"}} to arm the sweep.',
+        )
+
+    link, access, folder_id = _sweep_target(link_id, db)
+    candidates = _sweep_candidates(cloud_providers.list_files(link.provider, access))
+    referenced = _referenced_drive_files(db)
+    plan = _plan_sweep(candidates, folder_id, referenced)
+    # The listing's own `parents` says what to detach. Without `removeParents`
+    # Google simply adds the app folder and keeps the old parent, so the file
+    # would stay in My Drive root — the exact state the legacy bug created.
+    old_parents = {
+        entry["id"]: (entry.get("parents") or [None])[0] for entry in candidates
+    }
+
+    deleted = 0
+    moved = 0
+    failed: list[schemas.CloudSweepFailure] = []
+
+    def _record(file_id: str, exc: Exception) -> None:
+        reason = getattr(exc, "message", None) or str(exc) or "provider call failed"
+        failed.append(schemas.CloudSweepFailure(file_id=file_id, error=reason))
+
+    for item in plan:
+        file_id = item["file_id"]
+        if item["reason"] in ("orphan", "both"):
+            # A delete is irreversible, so re-check the live reference set even
+            # though `_plan_sweep` already excluded every referenced id.
+            if file_id in referenced:
+                continue
+            try:
+                cloud_providers.delete_file(link.provider, access, file_id)
+                deleted += 1
+            except Exception as exc:  # noqa: BLE001 — per-file best effort
+                logger.warning("orphan sweep could not delete %s: %s", file_id, exc)
+                _record(file_id, exc)
+            continue
+        # Misplaced but referenced: the row still needs it, so move it into
+        # the app folder instead of ever deleting it.
+        try:
+            cloud_providers.move_file(
+                link.provider, access, file_id, folder_id, old_parents.get(file_id)
+            )
+            moved += 1
+        except Exception as exc:  # noqa: BLE001 — per-file best effort
+            logger.warning("orphan sweep could not move %s: %s", file_id, exc)
+            _record(file_id, exc)
+
+    logger.info(
+        "orphan sweep on link %s: scanned=%s deleted=%s moved=%s failed=%s",
+        link.id,
+        len(candidates),
+        deleted,
+        moved,
+        len(failed),
+    )
+    return schemas.CloudSweepResult(
+        link_id=link.id,
+        scanned=len(candidates),
+        deleted=deleted,
+        moved=moved,
+        failed=failed,
+    )

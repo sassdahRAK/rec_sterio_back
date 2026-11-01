@@ -313,6 +313,63 @@ class CompleteCloudUploadIn(BaseModel):
     checksum_sha256: Optional[str] = None
 
 
+# ------------------------------------------------- cloud maintenance (sweep)
+
+
+class CloudOrphanFile(BaseModel):
+    """One drive file the sweep would act on.
+
+    `reason` is `orphan` (no `videos` row references it), `misplaced` (a row
+    references it, but it sits outside the app folder) or `both`. Only
+    `orphan`/`both` are deleted; `misplaced` is moved back into the folder.
+    """
+
+    file_id: str
+    name: Optional[str] = None
+    size: Optional[int] = None
+    reason: Literal["orphan", "misplaced", "both"]
+
+
+class CloudOrphanPlan(BaseModel):
+    """Dry-run answer: what a destructive sweep would delete or move."""
+
+    link_id: UUID
+    provider: str
+    app_folder_id: str
+    # Every non-folder file the provider listed, before classification.
+    scanned: int
+    # Reasons `orphan` and `both` are counted in `orphans`; `misplaced` and
+    # `both` in `misplaced`, so a `both` file is counted in each.
+    orphans: int
+    misplaced: int
+    plan: List[CloudOrphanFile]
+
+
+class CloudSweepIn(BaseModel):
+    """The confirmation phrase that arms the destructive sweep.
+
+    A plain string with a default so a missing/typo'd body answers the
+    explicit `400 confirmation_required` instead of a generic validation error.
+    """
+
+    confirm: str = ""
+
+
+class CloudSweepFailure(BaseModel):
+    file_id: str
+    error: str
+
+
+class CloudSweepResult(BaseModel):
+    """What a destructive sweep actually did. Failures never abort the run."""
+
+    link_id: UUID
+    scanned: int
+    deleted: int
+    moved: int
+    failed: List[CloudSweepFailure] = Field(default_factory=list)
+
+
 # ---------------------------------------------------------------- videos
 
 
