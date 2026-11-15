@@ -259,21 +259,26 @@ def verify_thumbnail_token(video_id, token: Optional[str]) -> bool:
 
 
 def public_thumbnail_url(video, folder: Optional[Folder] = None) -> Optional[str]:
-    """What a card's `thumbnail_url` should be.
+    """What a card's `thumbnail_url` should be, or None when there is no frame.
 
     When a frame is cached the local endpoint wins in every case: the bare path
     for a published folder, and a signed `?t=` path for any other folder
-    (private, passcode-reachable or share-reachable), because the platform CDN
-    URL expires and a private card would otherwise go blank.
+    (private, passcode-reachable or share-reachable), because a private card
+    would otherwise be unreadable.
+
+    With no cached frame the answer is None, never the stored CDN URL. That URL
+    is the platform's own and carries a short signature, so once the signature
+    ages out the browser blocks it and the card shows a broken image. A card
+    with no local bytes therefore gets no URL and renders its placeholder,
+    which is the honest state.
 
     The token is minted only here. This helper is called from serializers the
     caller has already reached by reading the collection, so being asked to
     describe a row is itself evidence that the row is readable; it must never
-    be wired into a code path that has not authorized the row first. With no
-    cached frame the stored CDN URL is returned unchanged.
+    be wired into a code path that has not authorized the row first.
     """
     if storage.thumbnail_file(video.id) is None:
-        return video.thumbnail_url
+        return None
     if folder is None:
         folder = _folder_for(video)
     path = f"/api/v1/public/videos/{video.id}/thumbnail"
