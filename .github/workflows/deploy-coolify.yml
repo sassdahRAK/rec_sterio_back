@@ -1,0 +1,35 @@
+name: Deploy to Coolify
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: coolify-deploy-backend
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    name: Deploy backend to Coolify
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Coolify deployment
+        env:
+          COOLIFY_TOKEN: ${{ secrets.COOLIFY_TOKEN }}
+        run: |
+          set -euo pipefail
+          response=$(curl --silent --show-error --fail-with-body \
+            --max-time 60 \
+            --request POST \
+            --header "Authorization: Bearer ${COOLIFY_TOKEN}" \
+            --header "Accept: application/json" \
+            --header "Content-Type: application/json" \
+            --data '{}' \
+            "http://13.140.58.119:8000/api/v1/deploy?uuid=1o7snprncraywmdytzsnpiiz&force=false")
+          echo "${response}"
+          echo "${response}" | python3 -c "import json,sys; d=json.load(sys.stdin); assert d.get('deployments'), d"
