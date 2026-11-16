@@ -35,6 +35,7 @@ from app.config import settings
 from app.db import get_db
 from app.errors import AppError
 from app.models import Folder, Transcript, Video
+from app.routers.folders import language_mix_for
 from app.schemas import (
     DataCardOut,
     GuestTokenResponse,
@@ -83,6 +84,7 @@ def _video_cards(db: Session, folder: Folder) -> list[DataCardOut]:
                 badge="cleaned" if (transcript is not None and transcript.cleaned) else "raw",
                 transcript_id=transcript.id if transcript is not None else None,
                 transcript_preview=preview,
+                language_mix=language_mix_for(transcript),
                 audio_available=storage.audio_file(video.id).exists(),
                 storage_backend=video.storage_backend,
                 storage_available=cloud_storage_available(video),

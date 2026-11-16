@@ -878,6 +878,22 @@ class GuestTokenResponse(BaseModel):
 
 # ---------------------------------------------------------------- public surface
 
+
+class LanguageMixOut(BaseModel):
+    """Per-language segment counts for a unit's transcript.
+
+    `km_en` is a segment that itself mixes both languages, which is the
+    research point of this corpus, so it is counted apart from `km` and `en`
+    rather than folded into either. `und` holds segments with no usable tag,
+    including a null `language` from an older Whisper run.
+    """
+
+    km: int = 0
+    km_en: int = 0
+    en: int = 0
+    und: int = 0
+
+
 class DataCardOut(BaseModel):
     """One video as the public dataset cards show it (instruction.txt #8, #9)."""
 
@@ -900,6 +916,12 @@ class DataCardOut(BaseModel):
     badge: Literal["raw", "cleaned"]
     transcript_id: Optional[UUID] = None
     transcript_preview: Optional[str] = None
+    # How many transcript segments fall in each language bucket. `km_en` is a
+    # segment that mixes both languages, which is the dataset's research
+    # point. None when the unit has no transcript, or a transcript with no
+    # segments, so the UI can tell "not transcribed" from "transcribed as
+    # nothing" instead of showing four zeros.
+    language_mix: Optional[LanguageMixOut] = None
     audio_available: bool = False
     media_url: str
     audio_url: str

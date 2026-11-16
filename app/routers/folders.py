@@ -53,6 +53,7 @@ from app.schemas import (
     FolderMemberOut,
     FolderOut,
     FolderUpdate,
+    LanguageMixOut,
     MemberInvite,
     MemberUpdate,
     VideoFolderUpdate,
@@ -406,6 +407,34 @@ def _scoped_video_uuids(principal: Principal) -> list[UUID]:
     return out
 
 
+def language_mix_for(transcript: Optional[Transcript]) -> Optional[LanguageMixOut]:
+    """Segment counts per language bucket, or None when there is nothing to count.
+
+    None rather than zeros for a transcript-less unit: the portal's rail must
+    be able to say "not transcribed" instead of drawing four empty bars. An
+    unrecognized tag, a missing key or a hand-edited non-object segment lands
+    in `und`, because this is stored JSON written by older schema versions and
+    a card listing must never fail over one odd row.
+    """
+    if transcript is None or not transcript.segments:
+        return None
+    mix = LanguageMixOut()
+    for segment in transcript.segments:
+        if not isinstance(segment, dict):
+            mix.und += 1
+            continue
+        language = segment.get("language")
+        if language == "km":
+            mix.km += 1
+        elif language == "km-en":
+            mix.km_en += 1
+        elif language == "en":
+            mix.en += 1
+        else:
+            mix.und += 1
+    return mix
+
+
 def _card(
     db: Session, video: Video, folder: Optional[Folder], principal: Principal
 ) -> DataCardOut:
@@ -431,6 +460,7 @@ def _card(
         badge="cleaned" if transcript is not None and transcript.cleaned else "raw",
         transcript_id=transcript.id if transcript else None,
         transcript_preview=preview,
+        language_mix=language_mix_for(transcript),
         audio_available=storage.audio_file(video.id).exists(),
         media_url=f"{base}/media",
         audio_url=f"{base}/audio",
