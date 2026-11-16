@@ -79,12 +79,16 @@ def _set_thumbnail_url(video_id, url):
 
 
 def test_public_thumbnail_url_without_a_cached_frame(client, auth_headers):
+    # A stored platform URL exists, but it is signed and short-lived: handing it
+    # to the browser would eventually render a broken image (ERR_BLOCKED_BY_ORB).
+    # With no local bytes the card must get no URL at all and draw its
+    # placeholder instead.
     _, video = _public_folder_and_video(client, auth_headers)
     _set_thumbnail_url(video["id"], CDN_URL)
 
     with SessionLocal() as db:
         row = db.get(Video, UUID(video["id"]))
-        assert public_thumbnail_url(row) == CDN_URL
+        assert public_thumbnail_url(row) is None
 
 
 def test_public_thumbnail_url_for_a_cached_public_video(client, auth_headers):

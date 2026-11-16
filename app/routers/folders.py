@@ -422,8 +422,8 @@ def _card(
         progress=video.progress or 0,
         error=video.error,
         duration_seconds=video.duration_seconds,
-        # Local frame when one is cached and the folder is published; the
-        # stored CDN URL otherwise (unchanged for private rows).
+        # Local frame when one is cached; no URL otherwise, because a stored
+        # platform URL expires and would show a broken image.
         thumbnail_url=thumbnail.public_thumbnail_url(video, folder),
         folder_id=video.folder_id,
         folder_name=folder.name if folder else None,
